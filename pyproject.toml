@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "local-mcp-control-center"
+version = "0.2.0"
+description = "Least-privilege local MCP control center for macOS"
+requires-python = ">=3.12"
+dependencies = [
+  "mcp>=2.1,<2.2",
+  "openpyxl>=3.1,<4",
+  "python-docx>=1.2,<2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+local-mcp = "local_mcp_control_center.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"

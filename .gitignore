@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+control.sqlite3
+control.sqlite3-*
+logs/*
+snapshots/*
+run/*
+config/*.local.json
