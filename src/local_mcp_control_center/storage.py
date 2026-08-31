@@ -130,6 +130,53 @@ class Store:
             command_digest TEXT,
             argv_json TEXT
         );
+        CREATE TABLE IF NOT EXISTS agent_tasks (
+            task_id TEXT PRIMARY KEY,
+            parent_task_id TEXT,
+            root_task_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            task_text TEXT NOT NULL,
+            scope_id TEXT NOT NULL REFERENCES scopes(id),
+            effective_scope_id TEXT NOT NULL REFERENCES scopes(id),
+            model_profile TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            status TEXT NOT NULL,
+            base_ref TEXT,
+            base_commit TEXT,
+            worktree_path TEXT,
+            source_dirty INTEGER,
+            source_head_commit TEXT,
+            capability_json TEXT NOT NULL,
+            owner_actor TEXT NOT NULL,
+            owner_session_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            started_at TEXT,
+            completed_at TEXT,
+            updated_at TEXT NOT NULL,
+            error_code TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_agent_tasks_status_created
+            ON agent_tasks(status, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_agent_tasks_root
+            ON agent_tasks(root_task_id, created_at);
+        CREATE TABLE IF NOT EXISTS agent_results (
+            task_id TEXT PRIMARY KEY REFERENCES agent_tasks(task_id) ON DELETE CASCADE,
+            status TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            changed_files_json TEXT NOT NULL,
+            verification_json TEXT NOT NULL,
+            tests_json TEXT NOT NULL,
+            worktree_json TEXT,
+            provider TEXT,
+            model TEXT,
+            warnings_json TEXT NOT NULL,
+            errors_json TEXT NOT NULL,
+            tool_calls INTEGER NOT NULL DEFAULT 0,
+            started_at TEXT,
+            completed_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS project_profiles (
             scope_id TEXT NOT NULL REFERENCES scopes(id) ON DELETE CASCADE,
             profile TEXT NOT NULL,
@@ -193,8 +240,15 @@ class Store:
                 "audit_events",
                 {"trace_id": "TEXT", "duration_ms": "INTEGER", "process_id": "TEXT"},
             )
+            self._ensure_columns(
+                "agent_tasks",
+                {"source_dirty": "INTEGER", "source_head_commit": "TEXT"},
+            )
             self._conn.execute(
                 "INSERT OR IGNORE INTO meta(key, value) VALUES('policy_version', '1')"
+            )
+            self._conn.execute(
+                "INSERT OR IGNORE INTO meta(key, value) VALUES('agent_runtime_schema', '1')"
             )
             now = utc_now()
             for definition in TOOL_DEFINITIONS:
@@ -460,8 +514,12 @@ class Store:
 
     def delete_scope(self, scope_id: str) -> None:
         with self._lock:
-            self._conn.execute("DELETE FROM scopes WHERE id=?", (scope_id,))
-            self._conn.commit()
+            try:
+                self._conn.execute("DELETE FROM scopes WHERE id=?", (scope_id,))
+                self._conn.commit()
+            except sqlite3.IntegrityError as exc:
+                self._conn.rollback()
+                raise StorageError("scope is referenced by persisted runtime state") from exc
 
     def permissions(self, scope_id: str) -> dict[str, dict[str, Any]]:
         rows = self._fetchall(
@@ -687,6 +745,189 @@ class Store:
 
     def list_runtime(self) -> list[dict[str, Any]]:
         return [dict(row) for row in self._fetchall("SELECT * FROM runtime_processes ORDER BY kind")]
+
+    # ---- provider-backed agent runtime ------------------------------------
+
+    def create_agent_task(self, data: dict[str, Any]) -> None:
+        fields = {
+            "task_id", "parent_task_id", "root_task_id", "role", "task_text", "scope_id",
+            "effective_scope_id", "model_profile", "provider", "model", "status", "base_ref",
+            "base_commit", "worktree_path", "source_dirty", "source_head_commit", "capability_json", "owner_actor", "owner_session_id",
+            "created_at", "started_at", "completed_at", "updated_at", "error_code",
+        }
+        required = fields - {"parent_task_id", "base_ref", "base_commit", "worktree_path", "source_dirty", "source_head_commit", "started_at", "completed_at", "error_code"}
+        if set(data) - fields or not required.issubset(data):
+            raise StorageError("Unsupported or incomplete agent task fields")
+        columns = ", ".join(data)
+        placeholders = ", ".join("?" for _ in data)
+        with self._lock:
+            try:
+                self._conn.execute(
+                    f"INSERT INTO agent_tasks ({columns}) VALUES ({placeholders})",
+                    tuple(data.values()),
+                )
+                self._conn.commit()
+            except sqlite3.IntegrityError as exc:
+                self._conn.rollback()
+                raise StorageError(str(exc)) from exc
+
+    def get_agent_task(self, task_id: str) -> dict[str, Any] | None:
+        row = self._fetchone("SELECT * FROM agent_tasks WHERE task_id=?", (task_id,))
+        return dict(row) if row else None
+
+    def list_agent_tasks(
+        self,
+        *,
+        scope_id: str | None = None,
+        status: str | None = None,
+        statuses: tuple[str, ...] | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        bounded_limit = max(1, min(int(limit), 1000))
+        clauses: list[str] = []
+        params: list[Any] = []
+        if scope_id is not None:
+            clauses.append("scope_id=?")
+            params.append(scope_id)
+        selected_statuses = statuses
+        if status is not None:
+            selected_statuses = (status,)
+        if selected_statuses:
+            placeholders = ",".join("?" for _ in selected_statuses)
+            clauses.append(f"status IN ({placeholders})")
+            params.extend(selected_statuses)
+        query = "SELECT * FROM agent_tasks"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(bounded_limit)
+        return [dict(row) for row in self._fetchall(query, params)]
+
+    def count_agent_tasks(
+        self,
+        *,
+        root_task_id: str | None = None,
+        statuses: tuple[str, ...] | None = None,
+    ) -> int:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if root_task_id is not None:
+            clauses.append("root_task_id=?")
+            params.append(root_task_id)
+        if statuses:
+            placeholders = ",".join("?" for _ in statuses)
+            clauses.append(f"status IN ({placeholders})")
+            params.extend(statuses)
+        query = "SELECT COUNT(*) AS count FROM agent_tasks"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        row = self._fetchone(query, params)
+        return int(row["count"]) if row else 0
+
+    def update_agent_task(self, task_id: str, **changes: Any) -> None:
+        allowed = {
+            "parent_task_id", "root_task_id", "role", "task_text", "scope_id", "effective_scope_id",
+            "model_profile", "provider", "model", "status", "base_ref", "base_commit",
+            "worktree_path", "source_dirty", "source_head_commit", "capability_json", "owner_actor", "owner_session_id", "created_at",
+            "started_at", "completed_at", "updated_at", "error_code",
+        }
+        unknown = set(changes) - allowed
+        if unknown:
+            raise StorageError(f"Unsupported agent task fields: {sorted(unknown)}")
+        if not changes:
+            return
+        changes.setdefault("updated_at", utc_now())
+        fields = ", ".join(f"{key}=?" for key in changes)
+        params = list(changes.values()) + [task_id]
+        with self._lock:
+            self._conn.execute(f"UPDATE agent_tasks SET {fields} WHERE task_id=?", params)
+            self._conn.commit()
+
+    def transition_agent_task(
+        self,
+        task_id: str,
+        *,
+        expected_statuses: tuple[str, ...],
+        status: str,
+        **changes: Any,
+    ) -> bool:
+        if not expected_statuses:
+            raise StorageError("agent task transition requires an expected status")
+        allowed = {"status", "started_at", "completed_at", "updated_at", "error_code"}
+        if set(changes) - allowed:
+            raise StorageError("Unsupported agent task transition fields")
+        changes = {"status": status, **changes}
+        changes.setdefault("updated_at", utc_now())
+        fields = ", ".join(f"{key}=?" for key in changes)
+        placeholders = ",".join("?" for _ in expected_statuses)
+        params = list(changes.values()) + [task_id, *expected_statuses]
+        with self._lock:
+            cursor = self._conn.execute(
+                f"UPDATE agent_tasks SET {fields} WHERE task_id=? AND status IN ({placeholders})",
+                params,
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
+
+    def save_agent_result(self, task_id: str, data: dict[str, Any]) -> None:
+        fields = {
+            "status", "summary", "changed_files_json", "verification_json", "tests_json",
+            "worktree_json", "provider", "model", "warnings_json", "errors_json", "tool_calls",
+            "started_at", "completed_at",
+        }
+        required = fields - {"worktree_json", "provider", "model", "started_at"}
+        if set(data) - fields or not required.issubset(data):
+            raise StorageError("Unsupported or incomplete agent result fields")
+        values = {"task_id": task_id, "updated_at": utc_now(), **data}
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO agent_results"
+                " (task_id, status, summary, changed_files_json, verification_json, tests_json, worktree_json, provider, model, warnings_json, errors_json, tool_calls, started_at, completed_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(task_id) DO UPDATE SET"
+                " status=excluded.status, summary=excluded.summary, changed_files_json=excluded.changed_files_json,"
+                " verification_json=excluded.verification_json, tests_json=excluded.tests_json, worktree_json=excluded.worktree_json,"
+                " provider=excluded.provider, model=excluded.model, warnings_json=excluded.warnings_json, errors_json=excluded.errors_json,"
+                " tool_calls=excluded.tool_calls, started_at=excluded.started_at, completed_at=excluded.completed_at, updated_at=excluded.updated_at",
+                tuple(values[key] for key in (
+                    "task_id", "status", "summary", "changed_files_json", "verification_json", "tests_json",
+                    "worktree_json", "provider", "model", "warnings_json", "errors_json", "tool_calls",
+                    "started_at", "completed_at", "updated_at",
+                )),
+            )
+            self._conn.commit()
+
+    def get_agent_result(self, task_id: str) -> dict[str, Any] | None:
+        row = self._fetchone("SELECT * FROM agent_results WHERE task_id=?", (task_id,))
+        if not row:
+            return None
+
+        def decode(name: str, default: Any) -> Any:
+            value = row[name]
+            if value is None:
+                return default
+            try:
+                return json.loads(value)
+            except (TypeError, json.JSONDecodeError):
+                return default
+
+        return {
+            "task_id": task_id,
+            "status": row["status"],
+            "summary": row["summary"],
+            "changed_files": decode("changed_files_json", []),
+            "verification": decode("verification_json", []),
+            "tests": decode("tests_json", []),
+            "worktree": decode("worktree_json", None),
+            "base_commit": None,
+            "provider": row["provider"],
+            "model": row["model"],
+            "warnings": decode("warnings_json", []),
+            "errors": decode("errors_json", []),
+            "tool_calls": int(row["tool_calls"]),
+            "started_at": row["started_at"],
+            "completed_at": row["completed_at"],
+        }
 
     def get_runtime(self, kind: str) -> dict[str, Any] | None:
         row = self._fetchone(

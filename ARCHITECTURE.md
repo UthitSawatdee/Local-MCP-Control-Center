@@ -1,6 +1,6 @@
 # Local MCP Control Center — Implementation Blueprint
 
-สถานะ: blueprint + runnable Python/Tkinter implementation 0.2.0 (P0/P1/P2 Developer Agent Runtime เพิ่มแล้ว; ยังไม่รวม UDS/Tauri/Rust และ macOS packaging ของ hardening)
+สถานะ: blueprint + runnable Python/Tkinter implementation 0.2.0 พร้อม provider-backed Agent Runtime V1 (ยังไม่รวม UDS/Tauri/Rust และ macOS packaging ของ hardening)
 
 วันที่: 2026-08-29
 
@@ -840,53 +840,70 @@ RUNTIME_NOT_READY
 - [OpenAI — MCP and Connectors](https://developers.openai.com/api/docs/guides/tools-connectors-mcp)
 - [OpenAI — Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)
 
-## 17. Actual Developer Agent Runtime (0.2.0)
+## 17. Actual Developer Agent Runtime V1
 
-หัวข้อนี้เป็น contract ที่มีอยู่จริงใน checkout นี้ ไม่ใช่ target architecture ที่ยังไม่ implement:
+หัวข้อนี้เป็น contract ที่มีอยู่จริงใน checkout นี้ ไม่ใช่ target architecture ที่ยังไม่ implement. Runtime ไม่มี Codex dependency:
 
 ```text
-ChatGPT / Codex / MCP client
-              │ stdio / tunnel
-              ▼
-      MCPServer + ToolRegistry
-       schema validation
-              ▼
-          Policy Broker
-   canonical scope/path + capability
-   approval + hash precondition + audit
-              ▼
- Filesystem/Search  ProjectProfile  GitAdapter  OwnedProcess
-              └──────────────┬─────────────────────────────┘
-                             ▼
-                 bounded structured result
-                 trace_id + SQLite audit chain
+ChatGPT Lead / MCP client
+          │ stdio / tunnel
+          ▼
+ MCPServer + ToolRegistry
+      schema validation
+          ▼
+      Policy Broker
+ scope + capability + audit
+          │
+          ▼
+ Provider-backed Agent Task API
+          │ create/get/list/result/cancel
+          ▼
+ AgentRuntimeService
+ role profiles + limits + SQLite lifecycle
+          │
+   ┌──────┼──────────┐
+   ▼      ▼          ▼
+ Provider Tool Facade WorktreeManager
+ adapter  → Broker   fixed Git only
 ```
 
-### Tool catalog
+### MCP Agent Task API
 
-| กลุ่ม | Tools ที่มีใน registry |
-|---|---|
-| Discovery | `list_scopes`, `list_files`, `read_file`, `search_text`, `find_files`, `search_regex`, `read_many_files`, `read_file_page`, `read_file_page_continue` |
-| Filesystem/Documents | `write_file`, `create_file`, `create_directory`, `rename_file`, `move_file`, `bulk_move_files`, `delete_file`, `csv_transform`, `xlsx_edit`, `docx_edit`, `apply_patch` |
-| Code intelligence/Context | `symbol_search`, `find_definition`, `find_references`, `workspace_snapshot`, `workspace_context`, `workspace_index`, `workspace_index_status`, `dependency_graph` |
-| Verification | `run_backend_test`, `run_frontend_test`, `run_targeted_test`, `run_lint`, `run_typecheck`, `run_build` |
-| Git | `git_status`, `git_diff`, `git_log`, `git_create_branch`, `git_stage_paths`, `git_commit`, `git_restore_file`, `git_push` |
-| Runtime/Control | `process_start_profile`, `process_status`, `process_logs`, `process_stop`, `runtime_status`, `tool_batch`, `dry_run`, `apply_approved_action` |
-| Delegated agent | `agent_status`, `agent_task_status`, `agent_task_logs`, `agent_result`, `agent_run`, `agent_cancel` |
+| Tool | Input summary | Output/behavior |
+|---|---|---|
+| `create_agent_task` | `role`, bounded `task`, approved `scope_id`, configured `model_profile`; optional `parent_task_id`, `base_ref` | Creates one persisted task; role/system instructions/capabilities are server-derived. |
+| `get_agent_task` | `task_id` | Returns finite lifecycle state, role/scope, provider/model, capability context and worktree/base metadata. |
+| `get_agent_result` | `task_id` | Returns terminal structured result: summary, actual changed files, verification, tests, worktree/base commit, provider/model, warnings/errors and timestamps. |
+| `list_agent_tasks` | optional approved `scope_id`, finite `status`, limit ≤ 100 | Returns bounded recent persisted metadata with per-scope visibility checks. |
+| `cancel_agent_task` | `task_id` | Signals only the owned worker, atomically marks it cancelled when active, preserves result metadata and audits the action. |
 
-### Actual security boundary
+The only task states are `queued`, `starting`, `running`, `completed`, `failed` and `cancelled`. Mutation/execute task tools are policy-disabled by default; they must be enabled in Control Center before appearing in MCP `tools/list`. Read-only task inspection is independently policy-controlled.
 
-- MCP clients submit scope-relative paths only. `PolicyEngine` canonicalizes and rejects traversal, absolute paths, symlinks, protected targets, overlapping scopes and unauthorized scopes before adapters run.
-- `ToolRegistry` metadata and broker-side schemas are authoritative. Function annotations in the transport are not a permission grant.
-- `READ` uses scope read; `WRITE` uses the relevant write/create/rename/move capability; `EXECUTE` uses the separate scope execute capability; dangerous delete/Git restore/push operations use the existing one-time, expiring GUI approval boundary.
-- `apply_patch` reads and hashes the current file, applies exact hunks, checkpoints and atomically replaces it. Execution repeats policy/hash checks immediately before mutation.
-- Project commands are selected from detected profiles and run as executable plus argv array with `shell=False`, a scrubbed environment, bounded output and timeout. Managed long-lived profiles receive an owned process group and bounded redacted logs; arbitrary PID/name killing is not exposed.
-- Git mutation is a small allowlist, never `git(args[])`: explicit branch/path/message validation, `--only` commit selection, no reset/clean/force operations, and restore/push approval.
-- Workspace index stores path metadata, hashes, language and lightweight symbol declarations outside the source tree. Context ranking is deterministic and cannot bypass explicit policy or force a file read.
-- Context ledger is process-local, bounded, redacted and digest-based at the Broker integration seam; it does not persist raw source or credentials. `tool_batch` has a fixed READ-only child allowlist and dispatches each child through the full Broker path, preserving per-child policy and audit. `dependency_graph` reads only approved canonical directories and emits relative metadata, bounded edges and unresolved diagnostics.
-- Delegated agent tasks use only control-plane registered `AgentProfile` values, approved project scopes, fixed argv, `shell=False`, a scrubbed environment, owned task/process state, bounded redacted logs, timeout and cancellation. Agent task state is in-memory; task output is not an independent verification result, and no OS sandbox is claimed.
-- Audit events include redacted metadata, `trace_id`, duration and process correlation where applicable; chain verification supports pre-upgrade legacy rows.
+### Role capability contract
 
-### Compatibility and deferred scope
+| Role | Allowed | Explicitly denied |
+|---|---|---|
+| Explorer | scoped read/search/list, Git reads, context/code discovery | write/create/delete, test execution, Git mutation, shell, worker spawn |
+| Implementer | scoped read/search, write/create in its isolated worktree, Git diff, targeted test profile | delete, rename/move, Git mutation/push/reset/clean, shell, worker spawn |
+| Reviewer | scoped read/search, Git reads/diff and context/code discovery; may inspect a parent Implementer worktree | all writes/creates/deletes, test execution, Git mutation, shell, worker spawn |
+| Tester | scoped read/search, Git reads, targeted test profile | source/test writes, create/delete, Git mutation, shell, worker spawn |
 
-The original tool names and input shapes remain registered. New tools are additive, and disabled mutation/execute tools do not appear in MCP `tools/list` until enabled in Control Center. File watchers, arbitrary child-MCP calls, browser automation and desktop automation remain intentionally deferred pending separate security review. Delegated-agent execution is available only for explicitly configured profiles and remains subject to the no-OS-sandbox limitation above.
+The role profile is persisted as an `AgentCapabilityContext`. The provider receives that context and a role-derived system instruction, but the `AgentToolFacade` remains authoritative and checks the role allowlist, current tool policy, effective scope capability, path policy, preconditions and cancellation before every operation. Workers cannot call the MCP task API or receive a child-agent tool.
+
+### Provider and runtime boundary
+
+`AgentModelProvider` exposes only `run_agent(...)` and `cancel(...)`. The runtime ships a fixed-endpoint `OpenAIChatProvider` adapter that reads `OPENAI_API_KEY` from local process configuration and uses `LOCAL_MCP_AGENT_MODEL` (default `gpt-5.6-luna`); `FakeModelProvider` supplies deterministic tests. Additional providers can be registered through the trusted local `AgentModelProfile` control-plane seam. MCP task input can select only a configured profile name; it cannot provide credentials, endpoint, executable, argv, environment, cwd or raw system prompt.
+
+`AgentRuntimeService` owns task threads, cancellation events, provider invocation, result normalization, restart recovery and runtime limits. SQLite tables `agent_tasks` and `agent_results` are additive to the existing Store and persist state across MCP request boundaries. Incomplete tasks found at startup become `failed` with `RUNTIME_RESTARTED`; the runtime does not silently retry.
+
+Defaults are explicit and hard-bounded: four concurrent workers, six workers per root task, 80 tool calls per worker, 1 MiB result, 1 MiB tool output and 15 minutes runtime. Configuration may lower these values, never raise the module hard caps.
+
+### Worktree and security boundary
+
+Implementers require a project scope with `read`, `write`, `create` and `execute`. For a Git repository root, `WorktreeManager` resolves a validated `base_ref` (default `HEAD`), records `base_commit` and source dirty state, then creates a server-generated detached worktree below the private application data directory. It never accepts a model-selected path, overwrites a collision, resets/cleans the main working tree, or automatically removes review evidence. Reviewers with an Implementer `parent_task_id` reuse that worktree through the hidden read-only effective scope.
+
+Every lifecycle transition and worktree creation is written to the existing redacted audit hash chain. Forbidden worker operations produce `TOOL_NOT_ALLOWED`/policy errors and an audit row. Existing Broker operations enforce canonical scope-relative paths, symlink/traversal/protected-target rules, exact write preconditions and fixed test/Git adapters. No arbitrary shell, unrestricted subprocess, recursive delete, force Git operation, credential access or recursive worker spawn is reachable from the Agent Task API.
+
+### Existing compatibility and deferred scope
+
+The original MCP tools and the earlier fixed-profile delegated-agent compatibility path remain registered; the provider-backed API is additive. The runtime uses local threads and fixed/scrubbed adapters, not an OS-level hostile-code sandbox. Automatic merge/push, autonomous planning, child MCP/browser/desktop automation, distributed workers, queue infrastructure and unrelated MRP changes remain out of scope for V1.

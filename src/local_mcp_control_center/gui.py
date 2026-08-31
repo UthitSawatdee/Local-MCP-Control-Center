@@ -608,7 +608,7 @@ class ControlCenterApp:
     def _close(self) -> None:
         self.supervisor.stop("tunnel")
         self.supervisor.stop("mcp_bridge")
-        self.broker.store.close()
+        self.broker.close()
         self.root.destroy()
 
 

@@ -55,7 +55,7 @@ Control Center ไม่ใช่ช่องแชต และไม่ใช�
 
 การสร้างและเลือก tunnel ต้องใช้สิทธิ์ของ Platform organization และ ChatGPT workspace แยกกัน ดูรายละเอียดใน [Secure MCP Tunnel ของ OpenAI](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)
 
-## Developer Agent Runtime (0.2.0)
+## Developer Agent Runtime
 
 รุ่นนี้เพิ่ม developer workflow แบบ additive โดยทุก MCP call ยังผ่าน `ToolRegistry → schema validation → PolicyEngine/Broker → adapter → audit` เส้นทางเดียว:
 
@@ -95,7 +95,30 @@ Process ใช้เฉพาะ executable/argument array จาก ProjectProf
 
 `tool_batch` มี parent scope เป็น anchor แต่ child ทุกตัวเรียกผ่าน Broker ใหม่และต้องผ่าน schema, tool policy, capability, path policy และ audit ของตัวเอง. `workspace_context` รับ `delivery_key` แบบ optional เพื่อเก็บเพียง digest ใน in-memory ledger; เมื่อ context เดิมไม่เปลี่ยนจะละเว้น snippets ซ้ำ. `dependency_graph` คืนเฉพาะ relative metadata/edges/diagnostics และมี bounds ของ files, edges, bytes และ output.
 
-Delegated agent ใช้เฉพาะ profile ที่ผู้ใช้ configure จาก control plane (`Broker.configure_agent_profile`); MCP caller ส่งได้เพียง `scope_id`, profile name, bounded prompt และ timeout. manager ไม่อ่าน credentials, ไม่รับ executable/argv/env/cwd/PID จาก MCP, ไม่ persist prompt และไม่ถือว่า agent claim เป็นผล verification.
+Delegated agent compatibility path ใช้เฉพาะ profile ที่ผู้ใช้ configure จาก control plane (`Broker.configure_agent_profile`); MCP caller ส่งได้เพียง `scope_id`, profile name, bounded prompt และ timeout. manager ไม่อ่าน credentials, ไม่รับ executable/argv/env/cwd/PID จาก MCP, ไม่ persist prompt และไม่ถือว่า agent claim เป็นผล verification.
+
+### Provider-backed Agent Task API V1
+
+นี่คือ orchestration path หลักสำหรับ worker แบบ `explorer`, `implementer`, `reviewer` และ `tester` โดย ChatGPT เป็น Lead ที่ตัดสินใจว่าจะ delegate เมื่อใด ส่วน MCP เป็น control plane ที่ validate, authorize, start, cancel, persist และ audit งาน เครื่องมือทั้งห้าคือ:
+
+```text
+create_agent_task  →  get_agent_task / get_agent_result
+                   →  list_agent_tasks / cancel_agent_task
+```
+
+`create_agent_task` รับเฉพาะ `role`, bounded `task`, approved `scope_id`, trusted `model_profile` และ optional `parent_task_id`/`base_ref`; ไม่มี raw system prompt, command, executable, environment, provider URL หรือ filesystem path ให้ caller/model เลือกเอง ระบบสร้าง capability context และ system instructions จาก role ฝั่ง server
+
+Provider ถูกลงทะเบียนจาก trusted local configuration ผ่าน `Broker.configure_agent_model_profile` หรือ `OPENAI_API_KEY` สำหรับ profile `openai-default` (endpoint ถูกกำหนดในโค้ด; model ใช้ `LOCAL_MCP_AGENT_MODEL` หรือค่าเริ่มต้น `gpt-5.6-luna`) และเลือกผ่านชื่อ profile เท่านั้น ไม่เก็บ key ใน SQLite หรือ audit การทดสอบใช้ `FakeModelProvider` แบบ deterministic ได้โดยไม่ต้องมี credential
+
+สถานะที่ persist มีเพียงชุดจำกัด `queued`, `starting`, `running`, `completed`, `failed`, `cancelled` ผลลัพธ์ประกอบด้วย summary, actual changed files, verification, tests, worktree/base commit, provider/model, warnings/errors และ timestamps. `get_agent_result` จะตอบ `RESULT_NOT_READY` จนกว่างานจะ terminal
+
+สิทธิ์ของ role ถูก enforce ที่ `AgentToolFacade` และ Broker อีกชั้นหนึ่ง: Explorer/Reviewer อ่านอย่างเดียว, Tester อ่านและรันเฉพาะ targeted-test profile, Implementer เขียน/สร้างได้เฉพาะ isolated Git worktree และรัน targeted test ได้ แต่ไม่มี delete, Git mutation, push, shell หรือ worker spawn. ทุก tool call ยังผ่าน path/protected-target/hash/precondition/audit ของ Broker เดิม
+
+Implementer ใช้ worktree ที่สร้างจาก `base_ref` (default `HEAD`) และบันทึก `base_commit`, source dirty state และ path ที่ระบบสร้างเอง; main working tree ไม่ถูก reset/clean/overwrite และ evidence ไม่ถูกลบอัตโนมัติ. Reviewer ที่ระบุ `parent_task_id` ของ Implementer จะอ่าน diff จาก worktree เดิมแบบ read-only
+
+ค่าเริ่มต้นที่ enforce: concurrent workers 4, workers ต่อ root 6, tool calls ต่อ worker 80, result 1 MiB และ runtime 15 นาที (ทุกค่ามี hard cap และลดได้จาก configuration). Worker ไม่สามารถเรียก `create_agent_task` หรือเปิด child MCP ได้ จึงไม่มี recursive self-orchestration ใน V1
+
+สร้าง/ยกเลิก tool เป็น mutation/execute policy จึงต้องเปิดใน Control Center ก่อนให้ปรากฏใน MCP `tools/list`; `get`, `result` และ `list` เป็น read-only discovery ที่เปิดได้ตาม policy. เมื่อปิด MCP แล้ว runtime ยังเป็น Python local service ที่ใช้ provider adapter ปกติ ไม่มี Codex API, Codex thread, Codex binary หรือ Codex session state เป็น runtime dependency
 
 ### Migration notes
 
@@ -205,7 +228,7 @@ brew install openai/tools/tunnel-client
 .venv/bin/python -m pytest
 ```
 
-ชุดทดสอบครอบคลุม path traversal/symlink/protected target, capability และ tool policy, approval hash/expiry/precondition, audit chain, atomic write/backup, fixed/project profiles, exact patch/paged reads, regex/discovery, managed process ownership/timeout/log redaction, controlled Git mutation, CSV/XLSX/DOCX adapters, context ledger bounds/redaction, compound READ dispatch, dependency graph limits และ delegated-agent ownership/timeout/log redaction
+ชุดทดสอบครอบคลุม path traversal/symlink/protected target, capability และ tool policy, approval hash/expiry/precondition, audit chain, atomic write/backup, fixed/project profiles, exact patch/paged reads, regex/discovery, managed process ownership/timeout/log redaction, controlled Git mutation, CSV/XLSX/DOCX adapters, context ledger bounds/redaction, compound READ dispatch, dependency graph limits, delegated-agent compatibility และ provider-backed agent task lifecycle/role policy/cancellation/worktree/MCP schema
 
 ## ขอบเขตของ MVP นี้
 
@@ -213,4 +236,4 @@ brew install openai/tools/tunnel-client
 
 Tunnel integration ในรุ่นนี้ใช้งานจริงผ่าน binary `tunnel-client` และ macOS Keychain แล้ว แต่ยังต้องให้ผู้ใช้สร้าง tunnel/permissions ใน Platform และผูก app ใน ChatGPT เอง เพราะเป็นขั้นตอน account/workspace ที่โปรแกรมไม่ควรทำแทนโดยเดา credential
 
-Developer runtime นี้มี context ledger แบบ in-memory bounded, dependency/import graph และ delegated-agent task manager ตามขอบเขต P2 แล้ว แต่ยังไม่รวม file watcher, arbitrary child MCP bridge, browser automation และ desktop/UI automation. P3 เหล่านี้ต้องผ่าน security review แยกก่อนเพิ่มขอบเขต และไม่มี OS-level sandbox สำหรับ trusted agent profile.
+Developer runtime นี้มี context ledger แบบ in-memory bounded, dependency/import graph, delegated-agent compatibility manager และ provider-backed Agent Task runtime แบบ persisted แล้ว แต่ยังไม่รวม file watcher, arbitrary child MCP bridge, browser automation, desktop/UI automation, automatic merge/push หรือ OS-level sandbox. P3 เหล่านี้ต้องผ่าน security review แยกก่อนเพิ่มขอบเขต; worker provider ปัจจุบันใช้ local thread และ fixed/scrubbed adapters จึงไม่อ้างว่าเป็น hostile-code sandbox

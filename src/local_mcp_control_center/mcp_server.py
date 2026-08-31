@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any, Literal
 
 from mcp.server.mcpserver import MCPServer
+from pydantic import Field
 
 from . import __version__
 from .broker import Broker
@@ -19,6 +20,9 @@ SERVER_INSTRUCTIONS = (
     "tool_batch accepts only its fixed READ-only child allowlist and still routes each child through the broker. "
     "dependency_graph returns bounded relative metadata only. Delegated agent tools accept only a configured profile "
     "name and approved project scope; they do not accept executable, argv, environment, cwd, or PID inputs. "
+    "Provider-backed Agent Task tools accept only predefined roles, bounded task text, approved scope IDs, and "
+    "trusted model-profile names. The server derives role permissions and system instructions, persists lifecycle "
+    "and results, and uses isolated Git worktrees for implementers. Workers cannot spawn workers or invoke shell. "
     "There is no unrestricted shell, desktop automation, browser automation, or child MCP bridge."
 )
 
@@ -249,6 +253,41 @@ def build_server(broker: Broker) -> MCPServer:
 
     def agent_cancel(task_id: str) -> dict[str, Any]:
         return broker.invoke("agent_cancel", {"task_id": task_id})
+
+    def create_agent_task(
+        role: Literal["explorer", "implementer", "reviewer", "tester"],
+        task: Annotated[str, Field(min_length=1, max_length=16_384)],
+        scope_id: Annotated[str, Field(min_length=1, max_length=64)],
+        model_profile: Annotated[str, Field(min_length=1, max_length=64)],
+        parent_task_id: Annotated[str | None, Field(min_length=1, max_length=64)] = None,
+        base_ref: Annotated[str | None, Field(min_length=1, max_length=200)] = None,
+    ) -> dict[str, Any]:
+        args = {
+            "role": role,
+            "task": task,
+            "scope_id": scope_id,
+            "model_profile": model_profile,
+            "parent_task_id": parent_task_id,
+            "base_ref": base_ref,
+        }
+        return broker.invoke("create_agent_task", {key: value for key, value in args.items() if value is not None})
+
+    def get_agent_task(task_id: str) -> dict[str, Any]:
+        return broker.invoke("get_agent_task", {"task_id": task_id})
+
+    def get_agent_result(task_id: str) -> dict[str, Any]:
+        return broker.invoke("get_agent_result", {"task_id": task_id})
+
+    def list_agent_tasks(
+        scope_id: Annotated[str | None, Field(min_length=1, max_length=64)] = None,
+        status: Literal["queued", "starting", "running", "completed", "failed", "cancelled"] | None = None,
+        limit: Annotated[int, Field(ge=1, le=100)] = 50,
+    ) -> dict[str, Any]:
+        args = {"scope_id": scope_id, "status": status, "limit": limit}
+        return broker.invoke("list_agent_tasks", {key: value for key, value in args.items() if value is not None})
+
+    def cancel_agent_task(task_id: str) -> dict[str, Any]:
+        return broker.invoke("cancel_agent_task", {"task_id": task_id})
 
     def symbol_search(
         scope_id: str,
@@ -502,6 +541,11 @@ def build_server(broker: Broker) -> MCPServer:
     register("agent_result", agent_result)
     register("agent_run", agent_run)
     register("agent_cancel", agent_cancel)
+    register("create_agent_task", create_agent_task)
+    register("get_agent_task", get_agent_task)
+    register("get_agent_result", get_agent_result)
+    register("list_agent_tasks", list_agent_tasks)
+    register("cancel_agent_task", cancel_agent_task)
     register("workspace_index", workspace_index)
     register("workspace_index_status", workspace_index_status)
     register("symbol_search", symbol_search)

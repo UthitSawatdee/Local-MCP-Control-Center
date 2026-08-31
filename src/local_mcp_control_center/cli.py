@@ -78,7 +78,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             launch_gui(broker, RuntimeSupervisor(store, broker.audit))
         finally:
-            store.close()
+            broker.close()
         return 0
 
     try:
@@ -116,7 +116,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0 if result.get("status") == "ok" else 2
         raise SystemExit(f"unsupported command: {args.command}")
     finally:
-        store.close()
+        broker.close()
 
 
 if __name__ == "__main__":

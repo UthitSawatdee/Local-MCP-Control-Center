@@ -129,12 +129,17 @@ TOOL_DEFINITIONS = TOOL_DEFINITIONS + (
     ToolDefinition("dry_run", "control", "Preview a registered action's permission class, scope/target summary, preconditions, expected effect, and approval requirement without executing it.", "low", True, ApprovalMode.NEVER),
     ToolDefinition("tool_batch", "control", "Run a bounded ordered batch of explicitly allowlisted READ-only tools. Each child independently passes schema, scope, capability and audit checks; writes, execution and dangerous operations are never fanned out.", "low", True, ApprovalMode.NEVER, permission_class="READ", read_only=True, parallel_safe=False),
     ToolDefinition("dependency_graph", "code", "Build a bounded deterministic Python/JavaScript/TypeScript dependency graph for one approved scope-relative directory. Results contain metadata, edges, unresolved imports and diagnostics, never source contents; ignored/protected trees and symlink escapes remain excluded.", "low", True, ApprovalMode.NEVER),
-    ToolDefinition("agent_status", "agent", "List configured local agent profile names and bounded task status. No executable, environment, credential or prompt data is exposed.", "low", True, ApprovalMode.NEVER),
+    ToolDefinition("agent_status", "agent", "List configured compatibility-agent and provider/model profile metadata plus bounded task status. No executable, environment, credential or prompt data is exposed.", "low", True, ApprovalMode.NEVER),
     ToolDefinition("agent_task_status", "agent", "Read one owned delegated-agent task status after the broker rechecks the task's approved scope visibility.", "low", True, ApprovalMode.NEVER),
     ToolDefinition("agent_task_logs", "agent", "Read bounded redacted logs for one owned delegated-agent task after scope visibility checks. Prompts and environments are never returned.", "low", True, ApprovalMode.NEVER),
     ToolDefinition("agent_result", "agent", "Read the bounded redacted result of one terminal owned delegated-agent task after scope visibility checks; a task claim is not independent verification.", "low", True, ApprovalMode.NEVER),
     ToolDefinition("agent_run", "agent", "Start one bounded task using an explicitly configured local agent profile and one approved project scope. The caller may provide only a prompt and bounded timeout; executable, argv, environment and cwd are configuration-only.", "critical", False, ApprovalMode.NEVER, permission_class="EXECUTE", read_only=False, parallel_safe=False),
     ToolDefinition("agent_cancel", "agent", "Cancel one owned delegated-agent task through its task ID after the broker rechecks the approved scope's execution capability. Arbitrary PIDs and process names are unavailable.", "critical", False, ApprovalMode.NEVER, permission_class="EXECUTE", read_only=False, parallel_safe=False),
+    ToolDefinition("create_agent_task", "agent", "Create one explicit bounded worker task for explorer, implementer, reviewer, or tester. Use only a role, task description, approved project scope ID, and configured model profile; optional parent_task_id/base_ref are validated locally. The server derives system instructions, permissions, provider, worktree and limits. Raw system prompts, commands, executables, environment values and provider URLs are not accepted.", "critical", False, ApprovalMode.NEVER, permission_class="EXECUTE", read_only=False, parallel_safe=False),
+    ToolDefinition("get_agent_task", "agent", "Read one persisted provider-backed worker task by task_id. Returns only bounded lifecycle metadata, role, scope, provider/model, capability context, worktree/base metadata and error state; task text and credentials are never returned.", "low", True, ApprovalMode.NEVER),
+    ToolDefinition("get_agent_result", "agent", "Read the structured result of one terminal provider-backed worker task. Returns summary, actual changed files, verification, tests, worktree/base commit, provider/model, warnings and errors. A non-terminal task returns RESULT_NOT_READY.", "low", True, ApprovalMode.NEVER),
+    ToolDefinition("list_agent_tasks", "agent", "List bounded recent persisted provider-backed worker tasks, optionally filtered by approved scope or finite lifecycle status. Results are metadata-only and visibility is rechecked per scope.", "low", True, ApprovalMode.NEVER),
+    ToolDefinition("cancel_agent_task", "agent", "Cancel one active provider-backed worker task by task_id. Only the owned worker is signalled, partial metadata is preserved, the state transition is atomic, and an audit event is written; arbitrary PIDs, commands and process names are unavailable.", "critical", False, ApprovalMode.NEVER, permission_class="EXECUTE", read_only=False, parallel_safe=False),
 )
 
 
@@ -255,6 +260,27 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         ("scope_id", "profile", "prompt"),
     ),
     "agent_cancel": _obj({"task_id": _string}, ("task_id",)),
+    "create_agent_task": _obj(
+        {
+            "role": {"type": "string", "enum": ["explorer", "implementer", "reviewer", "tester"]},
+            "task": {"type": "string", "minLength": 1, "maxLength": 16_384},
+            "scope_id": _string,
+            "model_profile": {"type": "string", "minLength": 1, "maxLength": 64},
+            "parent_task_id": {"type": ["string", "null"], "minLength": 1, "maxLength": 64},
+            "base_ref": {"type": ["string", "null"], "minLength": 1, "maxLength": 200},
+        },
+        ("role", "task", "scope_id", "model_profile"),
+    ),
+    "get_agent_task": _obj({"task_id": _string}, ("task_id",)),
+    "get_agent_result": _obj({"task_id": _string}, ("task_id",)),
+    "list_agent_tasks": _obj(
+        {
+            "scope_id": _string,
+            "status": {"type": "string", "enum": ["queued", "starting", "running", "completed", "failed", "cancelled"]},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+        },
+    ),
+    "cancel_agent_task": _obj({"task_id": _string}, ("task_id",)),
 }
 
 

@@ -11,9 +11,10 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from .agent_tasks import AgentProfile, AgentTaskManager
+from .agent_runtime import AgentModelProfile, AgentRuntimeLimits, AgentRuntimeService
 from .audit import AuditLog, sha256_json
 from .code_intelligence import WorkspaceIndexService
 from .compound_reads import CompoundReadExecutor
@@ -65,7 +66,13 @@ class RequestContext:
 class Broker:
     """The single local authority for MCP actions and GUI policy operations."""
 
-    def __init__(self, store: Store):
+    def __init__(
+        self,
+        store: Store,
+        *,
+        agent_runtime_limits: AgentRuntimeLimits | None = None,
+        agent_model_profiles: Mapping[str, AgentModelProfile] | None = None,
+    ):
         self.store = store
         self.data_dir = store.data_dir
         self.registry: ToolRegistry = DEFAULT_REGISTRY
@@ -77,6 +84,15 @@ class Broker:
         self.git = GitAdapter(self.runner)
         self.processes = ManagedProcessManager(self.store, self.audit)
         self.agent_tasks = AgentTaskManager(runtime_dir=self.data_dir / "agent-runtime")
+        self.agent_runtime = AgentRuntimeService(
+            store=self.store,
+            broker=self,
+            runner=self.runner,
+            audit=self.audit,
+            data_dir=self.data_dir,
+            limits=agent_runtime_limits,
+            model_profiles=agent_model_profiles,
+        )
         self.index = WorkspaceIndexService(self.store, self.filesystem)
         self.context_engine = WorkspaceContextService(self.filesystem, self.index)
         self.context_ledger = ContextLedger()
@@ -310,6 +326,31 @@ class Broker:
             metadata={"profile": profile.name},
         )
         return {"status": "ok", "profile": profile.name}
+
+    def configure_agent_model_profile(self, profile: AgentModelProfile) -> dict[str, Any]:
+        """Register a provider/model profile from trusted local configuration.
+
+        This is deliberately outside the MCP data plane.  MCP callers can
+        choose only the resulting profile name; they cannot provide provider
+        URLs, credentials, executables, environments, or system prompts.
+        """
+
+        self.agent_runtime.register_model_profile(profile)
+        self.audit.record(
+            actor="user",
+            tool="control.agent_model_profile",
+            operation="configure",
+            decision="executed",
+            target_display=profile.name,
+            metadata={"profile": profile.name, "provider": profile.provider_name, "model": profile.model},
+        )
+        return {"status": "ok", "profile": profile.to_dict()}
+
+    def close(self) -> None:
+        """Stop owned provider-backed workers before closing SQLite state."""
+
+        self.agent_runtime.shutdown()
+        self.store.close()
 
     # ---- MCP data plane ----------------------------------------------------
 
@@ -1418,9 +1459,18 @@ class Broker:
             "agent_status",
             "agent_status",
             "configured_agents",
-            metadata={"profiles": len(self.agent_tasks.profile_names()), "tasks": len(visible)},
+            metadata={
+                "profiles": len(self.agent_tasks.profile_names()),
+                "model_profiles": len(self.agent_runtime.profile_names()),
+                "tasks": len(visible),
+            },
         )
-        return {"status": "ok", "profiles": self.agent_tasks.profile_names(), "tasks": visible}
+        return {
+            "status": "ok",
+            "profiles": self.agent_tasks.profile_names(),
+            "model_profiles": self.agent_runtime.profile_metadata(),
+            "tasks": visible,
+        }
 
     def _agent_task_record(
         self,
@@ -1516,6 +1566,125 @@ class Broker:
             task_id,
             scope_id=scope_id,
             metadata={"state": result.get("state")},
+        )
+        return result
+
+    # ---- provider-backed Agent Task API -----------------------------------
+
+    def _agent_runtime_record(
+        self,
+        task_id: str,
+        context: RequestContext,
+        capability: str,
+    ) -> dict[str, Any]:
+        if not isinstance(task_id, str) or not task_id:
+            raise PolicyError("TASK_ID_INVALID", "task_id is required")
+        row = self.store.get_agent_task(task_id)
+        if row is None:
+            raise PolicyError("TASK_NOT_FOUND", "agent task was not found")
+        scope_id = row.get("scope_id")
+        if not isinstance(scope_id, str) or not scope_id:
+            raise PolicyError("TASK_SCOPE_UNKNOWN", "agent task has no approved scope")
+        self.policy.require_capability(scope_id, capability, actor=context.actor)
+        return row
+
+    def _tool_create_agent_task(self, args: dict[str, Any], context: RequestContext) -> dict[str, Any]:
+        result = self.agent_runtime.create_task(
+            role=self._require_string(args, "role"),
+            task=self._require_string(args, "task"),
+            scope_id=self._require_string(args, "scope_id"),
+            model_profile=self._require_string(args, "model_profile"),
+            parent_task_id=args.get("parent_task_id"),
+            base_ref=args.get("base_ref"),
+            actor=context.actor,
+            session_id=context.session_id,
+            trace_id=context.trace_id,
+        )
+        self._audit_success(
+            context,
+            "create_agent_task",
+            "create_task",
+            str(result.get("task_id", "agent-task")),
+            scope_id=args.get("scope_id") if isinstance(args.get("scope_id"), str) else None,
+            metadata={"role": result.get("role"), "state": result.get("status"), "model_profile": result.get("model_profile")},
+        )
+        return result
+
+    def _tool_get_agent_task(self, args: dict[str, Any], context: RequestContext) -> dict[str, Any]:
+        task_id = self._require_string(args, "task_id")
+        row = self._agent_runtime_record(task_id, context, Capability.READ)
+        result = self.agent_runtime.get_task(task_id)
+        self._audit_success(
+            context,
+            "get_agent_task",
+            "get_task",
+            task_id,
+            scope_id=str(row["scope_id"]),
+            metadata={"state": result.get("status")},
+        )
+        return result
+
+    def _tool_list_agent_tasks(self, args: dict[str, Any], context: RequestContext) -> dict[str, Any]:
+        scope_id = args.get("scope_id")
+        if scope_id is not None:
+            if not isinstance(scope_id, str) or not scope_id:
+                raise PolicyError("INVALID_INPUT", "scope_id must be text when supplied")
+            self.policy.require_capability(scope_id, Capability.READ, actor=context.actor)
+        tasks = self.agent_runtime.list_tasks(
+            scope_id=scope_id,
+            status=args.get("status"),
+            limit=self._bounded_int(args.get("limit", 50), 1, 100),
+        )
+        visible: list[dict[str, Any]] = []
+        for task in tasks:
+            item_scope = task.get("scope_id")
+            if not isinstance(item_scope, str):
+                continue
+            try:
+                self.policy.require_capability(item_scope, Capability.READ, actor=context.actor)
+            except PolicyError:
+                continue
+            visible.append(task)
+        self._audit_success(
+            context,
+            "list_agent_tasks",
+            "list_tasks",
+            "agent-tasks",
+            scope_id=scope_id if isinstance(scope_id, str) else None,
+            metadata={"count": len(visible)},
+        )
+        return {"status": "ok", "tasks": visible, "count": len(visible)}
+
+    def _tool_get_agent_result(self, args: dict[str, Any], context: RequestContext) -> dict[str, Any]:
+        task_id = self._require_string(args, "task_id")
+        row = self._agent_runtime_record(task_id, context, Capability.READ)
+        result = self.agent_runtime.get_result(task_id)
+        self._audit_success(
+            context,
+            "get_agent_result",
+            "get_result",
+            task_id,
+            scope_id=str(row["scope_id"]),
+            metadata={"state": result.get("status")},
+        )
+        return result
+
+    def _tool_cancel_agent_task(self, args: dict[str, Any], context: RequestContext) -> dict[str, Any]:
+        task_id = self._require_string(args, "task_id")
+        row = self._agent_runtime_record(task_id, context, Capability.EXECUTE)
+        result = self.agent_runtime.cancel_task(
+            task_id,
+            actor=context.actor,
+            session_id=context.session_id,
+            trace_id=context.trace_id,
+        )
+        self._audit_success(
+            context,
+            "cancel_agent_task",
+            "cancel_task",
+            task_id,
+            scope_id=str(row["scope_id"]),
+            metadata={"state": result.get("status")},
         )
         return result
 
