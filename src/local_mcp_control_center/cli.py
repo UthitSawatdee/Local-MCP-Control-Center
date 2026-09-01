@@ -86,7 +86,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             # tunnel-client passes its environment to the stdio child. The MCP
             # bridge has no reason to retain the tunnel runtime credential.
             os.environ.pop("CONTROL_PLANE_API_KEY", None)
-            run_stdio(broker)
+            try:
+                run_stdio(broker)
+            finally:
+                broker.close()
             return 0
         if args.command == "list-scopes":
             _emit({"status": "ok", "scopes": broker.policy.scope_summary(actor="user")})

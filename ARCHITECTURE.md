@@ -906,4 +906,4 @@ Every lifecycle transition and worktree creation is written to the existing reda
 
 ### Existing compatibility and deferred scope
 
-The original MCP tools and the earlier fixed-profile delegated-agent compatibility path remain registered; the provider-backed API is additive. The runtime uses local threads and fixed/scrubbed adapters, not an OS-level hostile-code sandbox. Automatic merge/push, autonomous planning, child MCP/browser/desktop automation, distributed workers, queue infrastructure and unrelated MRP changes remain out of scope for V1.
+The original MCP tools and the earlier fixed-profile delegated-agent compatibility path remain registered; the provider-backed API is additive. The runtime uses local threads and fixed/scrubbed adapters, not an OS-level hostile-code sandbox. Automatic merge/push, autonomous planning, child MCP/desktop automation, distributed workers, queue infrastructure, Motion-specific browser business adapters and unrelated MRP changes remain out of scope for V1. Generic Browser Automation V1 is documented in `docs/BROWSER_AUTOMATION.md` and remains behind the existing Broker/audit path.

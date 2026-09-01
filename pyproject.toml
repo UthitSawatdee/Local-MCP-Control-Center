@@ -12,6 +12,7 @@ dependencies = [
   "pydantic>=2,<3",
   "openpyxl>=3.1,<4",
   "python-docx>=1.2,<2",
+  "playwright>=1.48,<2",
 ]
 
 [project.optional-dependencies]

@@ -79,6 +79,7 @@ class ControlCenterApp:
         self._build_approvals(notebook)
         self._build_audit(notebook)
         self._build_runtime(notebook)
+        self._build_browser(notebook)
 
     def _build_overview(self, notebook: ttk.Notebook) -> None:
         frame = ttk.Frame(notebook, padding=18)
@@ -212,6 +213,32 @@ class ControlCenterApp:
         ttk.Button(actions, text="Run tunnel doctor", command=self._doctor_tunnel).pack(side="left", padx=(0, 8))
         ttk.Button(actions, text="Refresh", command=self.refresh_all).pack(side="left")
 
+    def _build_browser(self, notebook: ttk.Notebook) -> None:
+        frame = ttk.Frame(notebook, padding=18)
+        self.browser_frame = frame
+        notebook.add(frame, text="Browser")
+        ttk.Label(frame, text="Browser Profiles", font=("Helvetica", 20, "bold")).pack(anchor="w")
+        ttk.Label(
+            frame,
+            text="Browser automation stays behind Broker policy, exact origin allowlists, and the append-only audit chain.",
+            wraplength=920,
+        ).pack(anchor="w", pady=(4, 14))
+        profile = ttk.LabelFrame(frame, text="Motion ERP", padding=12)
+        profile.pack(fill="x")
+        ttk.Label(profile, text="Domain: dynamics-motion.asia.motionerpcloud.com").pack(anchor="w")
+        self.browser_state = tk.StringVar(value="Status: stopped")
+        ttk.Label(profile, textvariable=self.browser_state, justify="left", font=("Menlo", 11)).pack(anchor="w", pady=(8, 8))
+        actions = ttk.Frame(profile)
+        actions.pack(anchor="w")
+        ttk.Button(actions, text="Open Browser", command=self._open_browser).pack(side="left", padx=(0, 8))
+        ttk.Button(actions, text="Refresh Status", command=self._refresh_browser).pack(side="left", padx=(0, 8))
+        ttk.Button(actions, text="Clear Session", command=self._clear_browser_session).pack(side="left")
+        ttk.Label(
+            frame,
+            text="First login is manual in the owned Chromium window. Password fields and auth state never enter MCP snapshots or audit metadata. Enable the four browser tools in Tools before using them from ChatGPT, then restart the bridge.",
+            wraplength=920,
+        ).pack(anchor="w", pady=(16, 0))
+
     def refresh_all(self) -> None:
         self._refresh_overview()
         self._refresh_scopes()
@@ -219,6 +246,8 @@ class ControlCenterApp:
         self._refresh_approvals()
         self._refresh_audit()
         self._refresh_runtime()
+        self._refresh_browser()
+
 
     def _refresh_overview(self) -> None:
         runtime = self.broker.invoke("runtime_status", actor="user")
@@ -274,6 +303,40 @@ class ControlCenterApp:
     def _refresh_runtime(self) -> None:
         data = self.supervisor.status()
         self.runtime_text.set(format_runtime_status(data))
+
+    def _refresh_browser(self) -> None:
+        if not hasattr(self, "browser_state"):
+            return
+        data = self.broker.browser.status()
+        sessions = [item for item in data.get("sessions", []) if item.get("profile") == "motion-erp"]
+        if not sessions:
+            self.browser_state.set("Status: Browser stopped\nLogin state: Login required")
+            return
+        session = sessions[0]
+        auth = session.get("authenticated")
+        login_state = "Logged in" if auth is True else "Login required" if auth is False else "Unknown"
+        self.browser_state.set(
+            f"Status: running\nLogin state: {login_state}\nCurrent URL: {session.get('current_url') or 'about:blank'}"
+        )
+
+    def _open_browser(self) -> None:
+        result = self.broker.invoke("browser_open", {"profile": "motion-erp"}, actor="user")
+        if result.get("status") != "ok":
+            messagebox.showerror("Browser", result.get("message", result.get("error_code", "Browser open failed")))
+        self.refresh_all()
+
+    def _clear_browser_session(self) -> None:
+        sessions = [item for item in self.broker.browser.status().get("sessions", []) if item.get("profile") == "motion-erp"]
+        if not sessions:
+            self._refresh_browser()
+            return
+        if not messagebox.askyesno("Clear browser session", "Close the owned Motion ERP browser session? The persistent profile remains available for the next login."):
+            return
+        for session in sessions:
+            session_id = session.get("browser_session_id")
+            if isinstance(session_id, str):
+                self.broker.invoke("browser_close", {"browser_session_id": session_id}, actor="user")
+        self.refresh_all()
 
     def _add_scope(self, selection_kind: str) -> None:
         selected = (

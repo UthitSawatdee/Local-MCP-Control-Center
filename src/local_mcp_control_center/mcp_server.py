@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Annotated, Any, Literal
 
 from mcp.server.mcpserver import MCPServer
-from pydantic import Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from . import __version__
 from .broker import Broker
@@ -23,8 +23,15 @@ SERVER_INSTRUCTIONS = (
     "Provider-backed Agent Task tools accept only predefined roles, bounded task text, approved scope IDs, and "
     "trusted model-profile names. The server derives role permissions and system instructions, persists lifecycle "
     "and results, and uses isolated Git worktrees for implementers. Workers cannot spawn workers or invoke shell. "
-    "There is no unrestricted shell, desktop automation, browser automation, or child MCP bridge."
+    "There is no unrestricted shell, desktop automation, or child MCP bridge. Browser tools are opt-in, use only named profiles with exact origin allowlists, and accept no selectors, JavaScript, shell commands, credentials, or raw Playwright expressions."
 )
+
+
+class BrowserTarget(BaseModel):
+    """One snapshot reference; CSS selectors and arbitrary target data are disallowed."""
+
+    model_config = ConfigDict(extra="forbid")
+    ref: Annotated[str, Field(pattern=r"^e[1-9][0-9]{0,5}$")]
 
 
 def build_server(broker: Broker) -> MCPServer:
@@ -516,6 +523,42 @@ def build_server(broker: Broker) -> MCPServer:
     def runtime_status() -> dict[str, Any]:
         return broker.invoke("runtime_status")
 
+    def browser_open(profile: Literal["motion-erp"]) -> dict[str, Any]:
+        return broker.invoke("browser_open", {"profile": profile})
+
+    def browser_snapshot(
+        browser_session_id: Annotated[str, Field(min_length=4, max_length=128)],
+        max_bytes: Annotated[int, Field(ge=512, le=65_536)] = 65_536,
+    ) -> dict[str, Any]:
+        return broker.invoke(
+            "browser_snapshot",
+            {"browser_session_id": browser_session_id, "max_bytes": max_bytes},
+        )
+
+    def browser_run_command(
+        browser_session_id: Annotated[str, Field(min_length=4, max_length=128)],
+        action: Literal["navigate", "click", "fill", "select", "press", "wait", "read_text", "read_table", "submit"],
+        target: BrowserTarget | None = None,
+        url: Annotated[str, Field(min_length=1, max_length=4096)] | None = None,
+        value: Annotated[str, Field(max_length=65_536)] | None = None,
+        key: Annotated[str, Field(min_length=1, max_length=64)] | None = None,
+        timeout_ms: Annotated[int, Field(ge=1, le=60_000)] | None = None,
+    ) -> dict[str, Any]:
+        args: dict[str, Any] = {
+            "browser_session_id": browser_session_id,
+            "action": action,
+            "url": url,
+            "value": value,
+            "key": key,
+            "timeout_ms": timeout_ms,
+        }
+        if target is not None:
+            args["target"] = target.model_dump(exclude_none=True)
+        return broker.invoke("browser_run_command", {key: value for key, value in args.items() if value is not None})
+
+    def browser_close(browser_session_id: Annotated[str, Field(min_length=4, max_length=128)]) -> dict[str, Any]:
+        return broker.invoke("browser_close", {"browser_session_id": browser_session_id})
+
     def apply_approved_action(approval_id: str) -> dict[str, Any]:
         return broker.invoke("apply_approved_action", {"approval_id": approval_id})
 
@@ -580,6 +623,10 @@ def build_server(broker: Broker) -> MCPServer:
     register("process_stop", process_stop)
     register("runtime_status", runtime_status)
     register("apply_approved_action", apply_approved_action)
+    register("browser_open", browser_open)
+    register("browser_snapshot", browser_snapshot)
+    register("browser_run_command", browser_run_command)
+    register("browser_close", browser_close)
     return server
 
 

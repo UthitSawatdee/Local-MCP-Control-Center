@@ -16,6 +16,7 @@ from typing import Any, Callable, Mapping
 from .agent_tasks import AgentProfile, AgentTaskManager
 from .agent_runtime import AgentModelProfile, AgentRuntimeLimits, AgentRuntimeService
 from .audit import AuditLog, sha256_json
+from .browser import BrowserManager
 from .code_intelligence import WorkspaceIndexService
 from .compound_reads import CompoundReadExecutor
 from .context_engine import WorkspaceContextService
@@ -80,6 +81,10 @@ class Broker:
         self.policy = PolicyEngine(store, self.filesystem)
         self.audit = AuditLog(store)
         self.documents = DocumentAdapter()
+        self.browser = BrowserManager(
+            self.data_dir / "browser",
+            headless=os.environ.get("LOCAL_MCP_BROWSER_HEADLESS") == "1",
+        )
         self.runner = FixedRunner(self.data_dir)
         self.git = GitAdapter(self.runner)
         self.processes = ManagedProcessManager(self.store, self.audit)
@@ -347,10 +352,15 @@ class Broker:
         return {"status": "ok", "profile": profile.to_dict()}
 
     def close(self) -> None:
-        """Stop owned provider-backed workers before closing SQLite state."""
+        """Stop owned browser/provider runtimes before closing SQLite state."""
 
-        self.agent_runtime.shutdown()
-        self.store.close()
+        try:
+            self.browser.close_all()
+        finally:
+            try:
+                self.agent_runtime.shutdown()
+            finally:
+                self.store.close()
 
     # ---- MCP data plane ----------------------------------------------------
 
@@ -1902,10 +1912,100 @@ class Broker:
             "chatgpt_path": "ready_via_tunnel" if tunnel_state in {"healthy", "ready"} else "tunnel_client_running" if tunnel_state == "running" else "not_ready",
             "chatgpt_connection": "not_directly_observable",
             "tunnel_profile": (tunnel_config or {}).get("profile"),
+            "browser": self.browser.status(),
             "processes": self._visible_processes(context),
         }
         self._audit_success(context, "runtime_status", "read", ".", metadata={})
         return {"status": "ok", **data}
+
+    def _tool_browser_open(self, args: dict[str, Any], context: RequestContext) -> dict[str, Any]:
+        profile = self._require_string(args, "profile")
+        result = self.browser.open(profile)
+        self._audit_success(
+            context,
+            "browser_open",
+            "open",
+            profile,
+            metadata={
+                "profile": profile,
+                "browser_session_digest": self._browser_session_digest(result.get("browser_session_id")),
+                "origin": result.get("origin"),
+            },
+        )
+        return result
+
+    def _tool_browser_snapshot(self, args: dict[str, Any], context: RequestContext) -> dict[str, Any]:
+        session_id = self._require_string(args, "browser_session_id")
+        policy = self.store.get_tool_policy("browser_snapshot")
+        max_bytes = min(
+            int(args.get("max_bytes", policy.output_limit_bytes if policy else 65_536)),
+            int(policy.output_limit_bytes if policy else 65_536),
+            65_536,
+        )
+        result = self.browser.snapshot(session_id, max_bytes=max_bytes)
+        self._audit_success(
+            context,
+            "browser_snapshot",
+            "snapshot",
+            f"session:{self._browser_session_digest(session_id)}",
+            metadata={
+                "browser_session_digest": self._browser_session_digest(session_id),
+                "origin": result.get("origin"),
+                "bytes": len(str(result.get("snapshot", "")).encode("utf-8")),
+                "element_count": result.get("element_count", 0),
+                "table_count": result.get("table_count", 0),
+                "truncated": bool(result.get("truncated")),
+            },
+        )
+        return result
+
+    def _tool_browser_run_command(self, args: dict[str, Any], context: RequestContext) -> dict[str, Any]:
+        session_id = self._require_string(args, "browser_session_id")
+        action = self._require_string(args, "action")
+        policy = self.store.get_tool_policy("browser_run_command")
+        max_timeout = min(int(policy.max_duration_ms if policy else 30_000), 60_000)
+        requested_timeout = args.get("timeout_ms")
+        timeout_ms = max_timeout if requested_timeout is None else min(int(requested_timeout), max_timeout)
+        result = self.browser.execute(
+            session_id,
+            action,
+            target=args.get("target"),
+            url=args.get("url"),
+            value=args.get("value"),
+            key=args.get("key"),
+            timeout_ms=timeout_ms,
+        )
+        target = args.get("target")
+        target_display = f"session:{self._browser_session_digest(session_id)}"
+        if isinstance(target, dict) and isinstance(target.get("ref"), str):
+            target_display += f":ref={target['ref']}"
+        self._audit_success(
+            context,
+            "browser_run_command",
+            action,
+            target_display,
+            metadata={
+                "action": action,
+                "browser_session_digest": self._browser_session_digest(session_id),
+                "origin": result.get("origin"),
+                "current_url": result.get("current_url"),
+                "value_bytes": len(str(args.get("value", "")).encode("utf-8")) if action in {"fill", "select"} else None,
+                "text_bytes": len(str(result.get("text", "")).encode("utf-8")) if action == "read_text" else None,
+            },
+        )
+        return result
+
+    def _tool_browser_close(self, args: dict[str, Any], context: RequestContext) -> dict[str, Any]:
+        session_id = self._require_string(args, "browser_session_id")
+        result = self.browser.close(session_id)
+        self._audit_success(
+            context,
+            "browser_close",
+            "close",
+            f"session:{self._browser_session_digest(session_id)}",
+            metadata={"browser_session_digest": self._browser_session_digest(session_id)},
+        )
+        return result
 
     def _tool_apply_approved_action(self, args: dict[str, Any], context: RequestContext) -> dict[str, Any]:
         approval_id = self._require_string(args, "approval_id")
@@ -2814,10 +2914,22 @@ class Broker:
             value = args.get(key)
             if isinstance(value, str):
                 values.append(f"{key}={value[:160]}")
+        session_id = args.get("browser_session_id")
+        if isinstance(session_id, str):
+            values.append(f"browser_session_digest={Broker._browser_session_digest(session_id)}")
+        target = args.get("target")
+        if isinstance(target, dict) and isinstance(target.get("ref"), str):
+            values.append(f"target_ref={target['ref'][:32]}")
         paths = args.get("source_relative_paths")
         if isinstance(paths, list):
             values.append(f"source_relative_paths_count={len(paths)}")
         return ";".join(values)[:500]
+
+    @staticmethod
+    def _browser_session_digest(session_id: Any) -> str:
+        if not isinstance(session_id, str) or not session_id:
+            return "missing"
+        return sha256_bytes(session_id.encode("utf-8"))
 
     @staticmethod
     def _intent_display(intent: dict[str, Any]) -> str:

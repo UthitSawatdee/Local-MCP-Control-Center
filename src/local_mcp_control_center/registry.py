@@ -142,6 +142,15 @@ TOOL_DEFINITIONS = TOOL_DEFINITIONS + (
     ToolDefinition("cancel_agent_task", "agent", "Cancel one active provider-backed worker task by task_id. Only the owned worker is signalled, partial metadata is preserved, the state transition is atomic, and an audit event is written; arbitrary PIDs, commands and process names are unavailable.", "critical", False, ApprovalMode.NEVER, permission_class="EXECUTE", read_only=False, parallel_safe=False),
 )
 
+# Browser automation is opt-in.  Once enabled, all four tools still execute
+# only through Broker and the named profile's exact origin allowlist.
+TOOL_DEFINITIONS = TOOL_DEFINITIONS + (
+    ToolDefinition("browser_open", "browser", "Open or reuse one persistent, allowlisted browser profile. The caller can select only a configured profile; credentials, cookies, tokens, executable paths and process IDs are unavailable.", "high", False, ApprovalMode.NEVER, permission_class="EXECUTE", read_only=False, parallel_safe=False),
+    ToolDefinition("browser_snapshot", "browser", "Return a bounded structured accessibility/DOM snapshot with short-lived element refs. Password fields, cookies, tokens, hidden inputs and raw HTML are excluded.", "low", False, ApprovalMode.NEVER, permission_class="READ", read_only=True, parallel_safe=False),
+    ToolDefinition("browser_run_command", "browser", "Run one bounded declarative browser action against a current snapshot ref. Only navigate, click, fill, select, press, wait, read_text, read_table and submit are accepted; shell, JavaScript, selectors and raw Playwright expressions are unavailable.", "high", False, ApprovalMode.NEVER, permission_class="WRITE", read_only=False, parallel_safe=False),
+    ToolDefinition("browser_close", "browser", "Close one browser session owned by Control Center. It does not kill unrelated browser processes.", "high", False, ApprovalMode.NEVER, permission_class="EXECUTE", read_only=False, parallel_safe=False),
+)
+
 
 def _obj(properties: dict[str, Any], required: tuple[str, ...] = ()) -> dict[str, Any]:
     return {
@@ -155,6 +164,25 @@ def _obj(properties: dict[str, Any], required: tuple[str, ...] = ()) -> dict[str
 _string = {"type": "string", "minLength": 1}
 _relative_path = {"type": "string", "minLength": 1, "maxLength": 1024}
 _limit = {"type": "integer", "minimum": 1, "maximum": 1000}
+
+
+_browser_session = {"type": "string", "minLength": 4, "maxLength": 128}
+_browser_ref_target = _obj({"ref": {"type": "string", "pattern": "^e[1-9][0-9]{0,5}$"}}, ("ref",))
+
+
+def _browser_command_schema() -> dict[str, Any]:
+    common = {"browser_session_id": _browser_session}
+    return {
+        "oneOf": [
+            _obj({**common, "action": {"type": "string", "enum": ["navigate"]}, "url": {"type": "string", "minLength": 1, "maxLength": 4096}}, ("browser_session_id", "action", "url")),
+            _obj({**common, "action": {"type": "string", "enum": ["click"]}, "target": _browser_ref_target}, ("browser_session_id", "action", "target")),
+            _obj({**common, "action": {"type": "string", "enum": ["fill", "select"]}, "target": _browser_ref_target, "value": {"type": "string", "minLength": 0, "maxLength": 65_536}}, ("browser_session_id", "action", "target", "value")),
+            _obj({**common, "action": {"type": "string", "enum": ["press"]}, "target": _browser_ref_target, "key": {"type": "string", "minLength": 1, "maxLength": 64}}, ("browser_session_id", "action", "target", "key")),
+            _obj({**common, "action": {"type": "string", "enum": ["wait"]}, "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 60_000}}, ("browser_session_id", "action")),
+            _obj({**common, "action": {"type": "string", "enum": ["read_text", "read_table"]}, "target": _browser_ref_target}, ("browser_session_id", "action", "target")),
+            _obj({**common, "action": {"type": "string", "enum": ["submit"]}, "target": _browser_ref_target}, ("browser_session_id", "action", "target")),
+        ]
+    }
 
 
 TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
@@ -281,6 +309,10 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         },
     ),
     "cancel_agent_task": _obj({"task_id": _string}, ("task_id",)),
+    "browser_open": _obj({"profile": {"type": "string", "enum": ["motion-erp"]}}, ("profile",)),
+    "browser_snapshot": _obj({"browser_session_id": _browser_session, "max_bytes": {"type": "integer", "minimum": 512, "maximum": 65_536}}, ("browser_session_id",)),
+    "browser_run_command": _browser_command_schema(),
+    "browser_close": _obj({"browser_session_id": _browser_session}, ("browser_session_id",)),
 }
 
 

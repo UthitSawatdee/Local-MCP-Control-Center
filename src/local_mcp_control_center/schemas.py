@@ -8,6 +8,7 @@ well as the authoritative policy boundary.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 
@@ -77,6 +78,9 @@ def validate_schema(schema: dict[str, Any], value: Any, *, path: str = "$", root
             raise ValueError(f"{path}: text is shorter than the minimum length")
         if "maxLength" in schema and len(value) > int(schema["maxLength"]):
             raise ValueError(f"{path}: text is longer than the maximum length")
+        pattern = schema.get("pattern")
+        if isinstance(pattern, str) and re.fullmatch(pattern, value) is None:
+            raise ValueError(f"{path}: text does not match the required format")
 
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         if "minimum" in schema and value < schema["minimum"]:
