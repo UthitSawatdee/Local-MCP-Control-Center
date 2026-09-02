@@ -33,16 +33,18 @@ Chromium's local profile and is never returned through MCP or audit metadata.
 
 ## Motion ERP profile
 
-V1 contains one exact profile:
+V1 contains one named profile:
 
 ```text
-profile: motion-erp
-allowed origin: https://dynamics-motion.asia.motionerpcloud.com
+profile: MacBook-Pro--Uthit (derived from this machine's local hostname)
+starting origin: https://dynamics-motion.asia.motionerpcloud.com
+internet access: HTTP/HTTPS enabled
 ```
 
-Direct navigation, redirects, popups, and frame requests outside this origin
-are blocked with `DOMAIN_NOT_ALLOWED`. Wildcard internet browsing is not
-enabled.
+The local browser profile can navigate to HTTP/HTTPS internet pages and load HTTP/HTTPS
+resources from any origin, including redirects, popups, frames, and external
+assets used by Motion ERP. Non-web protocols such as `file:` and
+`javascript:` remain blocked with `DOMAIN_NOT_ALLOWED`.
 
 The first login is manual in the owned Chromium window. `browser_open` reports
 `authenticated: true` only when the Motion/Odoo application marker is present;
@@ -51,9 +53,9 @@ cannot be confirmed.
 
 ## Public tools
 
-All four tools are opt-in in Tools policy and route through `Broker.invoke`:
+All four tools are enabled by default in Tools policy and route through `Broker.invoke`:
 
-- `browser_open(profile)` opens or reuses the persistent `motion-erp` context.
+- `browser_open(profile)` opens or reuses the persistent local-host browser context.
 - `browser_snapshot(browser_session_id)` returns bounded structured DOM and ARIA-derived role/name lines plus bounded table rows. It omits hidden inputs and password fields.
 - `browser_run_command(...)` accepts only `navigate`, `click`, `fill`, `select`, `press`, `wait`, `read_text`, `read_table`, and `submit`. Targets are current snapshot refs such as `e42`; CSS, XPath, JavaScript, shell, raw Playwright expressions, and arbitrary endpoint fetches are not accepted.
 - `browser_close(browser_session_id)` closes only a session owned by Control Center.
@@ -79,6 +81,6 @@ redacted hash-chain audit. Passwords, cookies, authorization/session/CSRF
 tokens, local storage, full HTML, and secret-bearing URL parameters are not
 logged.
 
-After enabling browser tools in the GUI, restart the MCP bridge or tunnel-managed
-bridge. The GUI Runtime/Browser status distinguishes registry policy from the
-live `tools/list` snapshot; a stale bridge requires restart.
+After changing browser policy in the source or GUI, restart the MCP bridge or
+tunnel-managed bridge. The GUI Runtime/Browser status distinguishes registry
+policy from the live `tools/list` snapshot; a stale bridge requires restart.

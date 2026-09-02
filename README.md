@@ -70,8 +70,9 @@ MCP client
 เครื่องมือที่เพิ่ม/เปิดใช้ได้เมื่อผู้ใช้เปิด policy:
 
 - Discovery/files: `find_files`, `search_regex`, `read_many_files`, `read_file_page`, `read_file_page_continue`
+- Documents: `read_csv` สำหรับอ่าน CSV แบบ structured และมีขอบเขต row/column; `csv_transform`, `xlsx_edit`, `docx_edit` สำหรับแก้ไขเมื่อเปิด policy
 - Editing: `apply_patch` แบบ exact unified hunk พร้อม hash, backup และ changed line ranges
-- Verification: `run_targeted_test`, `run_lint`, `run_typecheck`; `run_backend_test`, `run_frontend_test`, `run_build` ยังคงเป็น compatibility tools
+- Verification: `run_targeted_test`, `run_lint`, `run_typecheck`, `run_backend_test`, `run_frontend_test`, `run_build`
 - Runtime: `process_start_profile`, `process_status`, `process_logs`, `process_stop`
 - Git: `git_create_branch`, `git_stage_paths`, `git_commit`, `git_restore_file`, `git_push`
 - Context/code: `workspace_snapshot`, `workspace_context`, `workspace_index`, `workspace_index_status`, `symbol_search`, `find_definition`, `find_references`, `dependency_graph`
@@ -80,14 +81,16 @@ MCP client
 
 Permission class มี `READ`, `WRITE`, `EXECUTE`, `DANGEROUS` และแยกจาก scope capabilities (`read`, `execute`, `write`, `create`, `rename`, `move`, `delete`) อย่างชัดเจน การเปิด tool ไม่ได้ grant สิทธิ์ scope เพิ่มเอง
 
+เครื่องมือที่ทำงานกับ project โดยตรงทุกตัวในกลุ่ม Git และ test/build รับ `scope_id` ที่จำเป็นต้องระบุทุกครั้ง เช่น `{"scope_id": "project-atm-coperation"}` หลังจากเรียก `list_scopes` เพื่อเลือก project ที่ถูกต้องแล้ว ห้ามปล่อยให้ Broker เดาจากจำนวน project ที่มองเห็นอยู่ จึงสามารถเรียกงานของหลาย project พร้อมกันได้โดยแต่ละ request ถูกตรวจ policy และส่งต่อไปยัง repository ของ scope นั้นเท่านั้น
+
 ตัวอย่าง workflow:
 
-1. เปิด `read` แล้วเรียก `list_scopes`, `workspace_snapshot`, `git_status`, `search_regex`, `read_many_files`
+1. เปิด `read` แล้วเรียก `list_scopes`, `workspace_snapshot`, `git_status(scope_id=...)`, `search_regex`, `read_many_files`
 2. เรียก `symbol_search`/`find_references` และ `dry_run` ก่อนแก้ไข
-3. เปิด `write` + `apply_patch`, ส่ง `expected_hash` เมื่อมี hash จากการอ่าน และตรวจ `git_diff`
-4. เปิด `execute` แล้วเรียก targeted test, lint, typecheck หรือ build ตาม ProjectProfile ที่ตรวจได้
-5. ใช้ `git_stage_paths`/`git_commit` กับ path ที่ระบุชัดเจนเท่านั้น
-6. ใช้ `git_restore_file`, `git_push` หรือ `delete_file` ได้เฉพาะหลัง `Approve once → Apply approved`
+3. เปิด `write` + `apply_patch`, ส่ง `expected_hash` เมื่อมี hash จากการอ่าน และตรวจ `git_diff(scope_id=...)`
+4. เปิด `execute` แล้วเรียก targeted test, lint, typecheck หรือ build พร้อม `scope_id` ตาม ProjectProfile ที่ตรวจได้
+5. ใช้ `git_stage_paths(scope_id=..., paths=...)`/`git_commit(scope_id=..., paths=..., message=...)` กับ path ที่ระบุชัดเจนเท่านั้น
+6. ใช้ `git_restore_file(scope_id=...)`, `git_push(scope_id=...)` หรือ `delete_file` ได้เฉพาะหลัง `Approve once → Apply approved`
 
 `apply_patch` ไม่ใช้ fuzzy matching; หาก context/hash เปลี่ยนจะคืน `PRECONDITION_CHANGED` หรือ `PATCH_CONTEXT_MISMATCH` และไม่เขียนทับเวอร์ชันใหม่. Paged read ใช้ continuation token ที่ผูกกับ actor, scope, path และ content hash. Context/index เป็นตัวช่วยจัดลำดับความเกี่ยวข้อง ไม่ใช่ตัวตัดสิน authorization
 
@@ -108,7 +111,9 @@ create_agent_task  →  get_agent_task / get_agent_result
 
 `create_agent_task` รับเฉพาะ `role`, bounded `task`, approved `scope_id`, trusted `model_profile` และ optional `parent_task_id`/`base_ref`; ไม่มี raw system prompt, command, executable, environment, provider URL หรือ filesystem path ให้ caller/model เลือกเอง ระบบสร้าง capability context และ system instructions จาก role ฝั่ง server
 
-Provider ถูกลงทะเบียนจาก trusted local configuration ผ่าน `Broker.configure_agent_model_profile` หรือ `OPENAI_API_KEY` สำหรับ profile `openai-default` (endpoint ถูกกำหนดในโค้ด; model ใช้ `LOCAL_MCP_AGENT_MODEL` หรือค่าเริ่มต้น `gpt-5.6-luna`) และเลือกผ่านชื่อ profile เท่านั้น ไม่เก็บ key ใน SQLite หรือ audit การทดสอบใช้ `FakeModelProvider` แบบ deterministic ได้โดยไม่ต้องมี credential
+Provider ถูกลงทะเบียนจาก trusted local configuration ผ่าน `Broker.configure_agent_model_profile` หรือ `OPENAI_API_KEY` สำหรับ profile `openai-default` (endpoint ถูกกำหนดในโค้ด; model ใช้ `LOCAL_MCP_AGENT_MODEL` หรือค่าเริ่มต้น `gpt-5.6-luna`, reasoning ใช้ `LOCAL_MCP_AGENT_REASONING_EFFORT` หรือค่าเริ่มต้น `max`) และเลือกผ่านชื่อ profile เท่านั้น ไม่เก็บ key ใน SQLite หรือ audit การทดสอบใช้ `FakeModelProvider` แบบ deterministic ได้โดยไม่ต้องมี credential
+
+ใน `agent_status`, `profiles` คือรายการ compatibility agent แบบ executable เดิม ส่วน `model_profiles` คือ provider-backed agent ที่ใช้กับ `create_agent_task`; เมื่อมี `OPENAI_API_KEY` จะมี profile `openai-default` พร้อม `model: gpt-5.6-luna` และ `reasoning_effort: max` โดยอัตโนมัติ
 
 สถานะที่ persist มีเพียงชุดจำกัด `queued`, `starting`, `running`, `completed`, `failed`, `cancelled` ผลลัพธ์ประกอบด้วย summary, actual changed files, verification, tests, worktree/base commit, provider/model, warnings/errors และ timestamps. `get_agent_result` จะตอบ `RESULT_NOT_READY` จนกว่างานจะ terminal
 
@@ -120,9 +125,11 @@ Implementer ใช้ worktree ที่สร้างจาก `base_ref` (def
 
 สร้าง/ยกเลิก tool เป็น mutation/execute policy จึงต้องเปิดใน Control Center ก่อนให้ปรากฏใน MCP `tools/list`; `get`, `result` และ `list` เป็น read-only discovery ที่เปิดได้ตาม policy. เมื่อปิด MCP แล้ว runtime ยังเป็น Python local service ที่ใช้ provider adapter ปกติ ไม่มี Codex API, Codex thread, Codex binary หรือ Codex session state เป็น runtime dependency
 
+ในหน้า `Overview`, `Tools` และ `Runtime` ตัวเลขถูกแยกเป็น `Registry total` (จำนวน tool definitions ใน source registry), `Enabled` (จำนวน policy ที่เปิดอยู่ใน SQLite) และ `Running bridge tools` (จำนวนที่ MCP bridge register ไว้ตอน process เริ่มจริง). GUI จะ poll สถานะ bridge อัตโนมัติทุก 1 วินาที; ถ้า policy version ปัจจุบันไม่ตรงกับ snapshot ของ bridge จะแสดง `Bridge stale` และปุ่ม `Restart bridge` จะ restart standalone bridge หรือ tunnel-managed bridge ให้ถูกตัว เพื่อให้ `tools/list` กลับมาตรงกับ policy ล่าสุด
+
 ### Migration notes
 
-เครื่องมือเดิมและชื่อเดิมยังอยู่ใน registry; client เดิมที่เรียก `list_scopes`, filesystem primitives, document tools, `git_status`/`git_diff`/`git_log`, test/build และ `runtime_status` ไม่ต้องเปลี่ยน contract. Client ใหม่ควรใช้ `run_targeted_test` แทนการประกอบ command เอง และใช้ `apply_patch` แทนการเขียน source ทั้งไฟล์เมื่อแก้เฉพาะจุด
+ชื่อเครื่องมือเดิมยังอยู่ใน registry แต่ project-bound Git และ test/build tools เปลี่ยนเป็น contract ที่รับ `scope_id` แบบบังคับ เพื่อรองรับหลาย project พร้อมกันและป้องกันการ route ผิด repository; client ที่เคยเรียกแบบไม่มี scope ต้องเพิ่ม `scope_id` จากผล `list_scopes`. Client ใหม่ควรใช้ `run_targeted_test` แทนการประกอบ command เอง และใช้ `apply_patch` แทนการเขียน source ทั้งไฟล์เมื่อแก้เฉพาะจุด
 
 ### เปิด GUI
 
@@ -131,7 +138,13 @@ cd /path/to/local-mcp-control-center
 .venv/bin/local-mcp --data-dir "$HOME/Library/Application Support/LocalMCPControlCenter" gui
 ```
 
-ในรุ่นนี้ยังเป็น Tkinter reference app จึงยังไม่มี `.app` สำหรับดับเบิลคลิกจาก Applications
+สำหรับ macOS สามารถสร้าง icon สำหรับเปิด GUI โดยไม่ต้องเปิด Terminal ทุกครั้ง:
+
+```text
+.venv/bin/python scripts/build_macos_app.py
+```
+
+คำสั่งนี้จะสร้าง `~/Applications/Local MCP Control Center.app` โดยใช้ checkout และ `.venv` ปัจจุบัน หลังจากสร้างแล้วให้ดับเบิลคลิกจาก Applications หรือ drag ไปไว้ที่ Dock ได้เลย แอปจะเปิด Tkinter GUI โดยตรงและเขียน log ของ launcher ไว้ที่ `~/Library/Application Support/LocalMCPControlCenter/logs/gui-launcher.log` หากย้าย repository หรือสร้าง `.venv` ใหม่ ให้เรียกคำสั่งสร้าง app อีกครั้ง
 
 ## เริ่มใช้งานกับ Project-ATM-Coperation
 
@@ -210,6 +223,29 @@ python -m local_mcp_control_center --data-dir <private-data-dir> mcp
 ```
 
 ไม่ควรกด `Start MCP bridge` พร้อมกับ `Start tunnel` เพราะ tunnel-client จะ start MCP bridge ของ profile ให้เองอยู่แล้ว ปุ่ม `Start MCP bridge` มีไว้สำหรับตรวจ MCP แบบ standalone เท่านั้น
+
+## DevOS WorkspaceEngine
+
+WorkspaceEngine เป็น contract กลางสำหรับงานสำรวจและส่งต่องานใน project scope เดียวกัน โดย Broker ยังเป็นผู้ตรวจ policy/capability เพียงจุดเดียว:
+
+```text
+workspace_observe <project-id>       # bounded read-only health snapshot
+workspace_prepare <project-id> ...   # WorkPackage + persisted WorkRun
+workspace_run_status <run-id>        # package + append-only evidence
+workspace_finish <run-id>            # handoff + verification readiness
+workspace_action_proposals [project] # list only; never applies actions
+workspace_propose_action <run-id> ... # opt-in exact proposal; approval required before Apply
+```
+
+ใช้ผ่าน CLI ได้เช่นกัน:
+
+```text
+.venv/bin/local-mcp --data-dir '<private-data-dir>' doctor <project-id>
+.venv/bin/local-mcp --data-dir '<private-data-dir>' prepare <project-id> 'fix parser' --scope src
+.venv/bin/local-mcp --data-dir '<private-data-dir>' propose-action <run-id> targeted_verification --parameters-json '{"target":"backend","test_path":"tests/test_parser.py"}'
+```
+
+ข้อมูล Capsule, Snapshot, WorkRun, Evidence และ Handoff เก็บใน SQLite แบบ bounded/additive. Observer ใช้เฉพาะ fixed probes, แสดงชื่อไฟล์ลับได้เพื่อเตือนว่า tracked หรือไม่ แต่ไม่อ่านเนื้อหา `.env`, credential, token หรือ private key. `workspace_propose_action` ปิดเป็นค่าเริ่มต้นและสร้างได้เฉพาะ proposal แบบ exact สำหรับ owned service, targeted verification, commit และ push; ตัว proposal ไม่ execute เอง ต้องผ่าน Approve once → Apply approved และ Broker จะ recheck policy/capability/preconditions อีกครั้ง. Commit proposal ไม่รับไฟล์ที่ dirty อยู่ก่อน WorkRun และ push approval ผูกกับ branch + HEAD commit ที่อนุมัติไว้ จึง invalidate เมื่อ HEAD เปลี่ยน
 
 ถ้า Start tunnel พบ 401 ระหว่างเริ่มต้น โปรแกรมจะหยุด client ที่ authenticate ไม่ผ่านให้เอง เพื่อไม่ให้ process วน retry และแสดงขั้นตอนให้เปลี่ยน key ก่อนเริ่มใหม่
 

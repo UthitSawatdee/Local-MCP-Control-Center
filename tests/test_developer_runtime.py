@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import subprocess
 import sys
+from threading import Lock
 import time
 from pathlib import Path
 
@@ -10,7 +12,7 @@ import pytest
 from local_mcp_control_center.errors import PolicyError
 from local_mcp_control_center.filesystem import sha256_file
 from local_mcp_control_center.processes import ManagedProcessManager
-from local_mcp_control_center.runner import ProjectProfile
+from local_mcp_control_center.runner import CommandResult, ProjectProfile
 
 from .conftest import add_scope, allow_capabilities, enable_tools
 
@@ -171,7 +173,7 @@ def test_execution_and_profile_boundaries(broker, workspace: Path) -> None:
     add_scope(broker, workspace, kind="project")
     enable_tools(broker, "run_targeted_test", "process_start_profile")
 
-    denied = broker.invoke("run_targeted_test", {"target": "auto"})
+    denied = broker.invoke("run_targeted_test", {"scope_id": "test-scope", "target": "auto"})
     assert denied["error_code"] == "CAPABILITY_DENIED"
     arbitrary = broker.invoke(
         "process_start_profile",
@@ -238,24 +240,117 @@ def test_controlled_git_mutation_and_dangerous_approval(broker, workspace: Path)
     allow_capabilities(broker, "test-scope", "read", "execute")
     enable_tools(broker, "git_create_branch", "git_stage_paths", "git_commit", "git_restore_file", "git_push")
 
-    branch = broker.invoke("git_create_branch", {"branch": "codex/safe-change"})
+    branch = broker.invoke("git_create_branch", {"scope_id": "test-scope", "branch": "codex/safe-change"})
     assert branch["status"] == "ok", branch
     tracked.write_text("two\n", encoding="utf-8")
-    staged = broker.invoke("git_stage_paths", {"paths": ["tracked.txt"]})
+    staged = broker.invoke("git_stage_paths", {"scope_id": "test-scope", "paths": ["tracked.txt"]})
     assert staged["status"] == "ok", staged
-    committed = broker.invoke("git_commit", {"message": "test controlled commit", "paths": ["tracked.txt"]})
+    committed = broker.invoke(
+        "git_commit",
+        {"scope_id": "test-scope", "message": "test controlled commit", "paths": ["tracked.txt"]},
+    )
     assert committed["status"] == "ok", committed
     assert "tracked.txt" in committed["result"]["stdout"] or committed["result"]["exit_code"] == 0
 
     tracked.write_text("three\n", encoding="utf-8")
-    restore = broker.invoke("git_restore_file", {"path": "tracked.txt"})
+    restore = broker.invoke("git_restore_file", {"scope_id": "test-scope", "path": "tracked.txt"})
     assert restore["status"] == "approval_required"
     assert tracked.read_text(encoding="utf-8") == "three\n"
-    push = broker.invoke("git_push", {"remote": "origin"})
+    push = broker.invoke("git_push", {"scope_id": "test-scope", "remote": "origin"})
     assert push["status"] == "approval_required"
     assert not (workspace / "escaped").exists()
 
     assert broker.invoke("reset", {"args": ["--hard"]})["error_code"] == "TOOL_NOT_FOUND"
+    assert broker.verify_audit()["valid"] is True
+
+
+def test_project_tools_route_concurrently_by_explicit_scope(
+    broker,
+    workspace: Path,
+    monkeypatch,
+) -> None:
+    projects = {
+        "project-alpha": "alpha",
+        "project-beta": "beta",
+    }
+    roots: dict[str, Path] = {}
+    for scope_id, marker in projects.items():
+        root = workspace / scope_id
+        root.mkdir()
+        (root / "tracked.txt").write_text(f"{marker}-before\n", encoding="utf-8")
+        _git(root, "init", "-q")
+        _git(root, "config", "user.email", "test@example.invalid")
+        _git(root, "config", "user.name", "Multi Project Test")
+        _git(root, "add", "tracked.txt")
+        _git(root, "commit", "-qm", "initial")
+        (root / "tracked.txt").write_text(f"{marker}-after\n", encoding="utf-8")
+        (root / f"only-{marker}.txt").write_text("untracked\n", encoding="utf-8")
+        add_scope(broker, root, scope_id=scope_id, kind="project")
+        allow_capabilities(broker, scope_id, "read", "execute")
+        roots[scope_id] = root
+
+    enable_tools(
+        broker,
+        "git_status",
+        "git_diff",
+        "git_log",
+        "git_commit",
+        "run_targeted_test",
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        statuses = list(
+            executor.map(
+                lambda scope_id: broker.invoke("git_status", {"scope_id": scope_id}),
+                projects,
+            )
+        )
+
+    assert {result["scope_id"] for result in statuses} == set(projects)
+    for scope_id, marker in projects.items():
+        result = next(item for item in statuses if item["scope_id"] == scope_id)
+        assert f"only-{marker}.txt" in result["result"]["stdout"]
+
+    called_roots: list[Path] = []
+    called_roots_lock = Lock()
+
+    def fake_run_project_profile(profile, project_root, **kwargs):
+        with called_roots_lock:
+            called_roots.append(project_root)
+        return CommandResult(profile, "python -m pytest", 0, "", "", False)
+
+    monkeypatch.setattr(broker.runner, "run_project_profile", fake_run_project_profile)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        tests = list(
+            executor.map(
+                lambda scope_id: broker.invoke(
+                    "run_targeted_test",
+                    {"scope_id": scope_id, "target": "backend"},
+                ),
+                projects,
+            )
+        )
+
+    assert all(result["status"] == "ok" for result in tests), tests
+    assert set(called_roots) == set(roots.values())
+
+    committed = broker.invoke(
+        "git_commit",
+        {
+            "scope_id": "project-alpha",
+            "message": "commit alpha only",
+            "paths": ["tracked.txt"],
+        },
+    )
+    assert committed["status"] == "ok", committed
+    alpha_log = broker.invoke("git_log", {"scope_id": "project-alpha"})
+    beta_log = broker.invoke("git_log", {"scope_id": "project-beta"})
+    assert "commit alpha only" in alpha_log["result"]["stdout"]
+    assert "commit alpha only" not in beta_log["result"]["stdout"]
+    assert (roots["project-beta"] / "tracked.txt").read_text(encoding="utf-8") == "beta-after\n"
+
+    missing_scope = broker.invoke("git_status")
+    assert missing_scope["error_code"] == "INVALID_INPUT"
     assert broker.verify_audit()["valid"] is True
 
 
@@ -302,7 +397,7 @@ def test_registered_project_developer_workflow_sequence(broker, workspace: Path)
 
     assert broker.invoke("list_scopes", trace_id=trace_id)["status"] == "ok"
     assert broker.invoke("workspace_snapshot", {"scope_id": "test-scope"}, trace_id=trace_id)["status"] == "ok"
-    assert broker.invoke("git_status", trace_id=trace_id)["status"] == "ok"
+    assert broker.invoke("git_status", {"scope_id": "test-scope"}, trace_id=trace_id)["status"] == "ok"
     assert broker.invoke(
         "search_regex",
         {"scope_id": "test-scope", "pattern": r"def\s+greet", "relative_path": "backend"},
@@ -325,7 +420,11 @@ def test_registered_project_developer_workflow_sequence(broker, workspace: Path)
         trace_id=trace_id,
     )["results"]
 
-    assert broker.invoke("git_create_branch", {"branch": "codex/workflow"}, trace_id=trace_id)["status"] == "ok"
+    assert broker.invoke(
+        "git_create_branch",
+        {"scope_id": "test-scope", "branch": "codex/workflow"},
+        trace_id=trace_id,
+    )["status"] == "ok"
     patched = broker.invoke(
         "apply_patch",
         {
@@ -337,22 +436,26 @@ def test_registered_project_developer_workflow_sequence(broker, workspace: Path)
         trace_id=trace_id,
     )
     assert patched["status"] == "ok"
-    assert broker.invoke("git_diff", trace_id=trace_id)["result"]["stdout"]
+    assert broker.invoke("git_diff", {"scope_id": "test-scope"}, trace_id=trace_id)["result"]["stdout"]
     tested = broker.invoke(
         "run_targeted_test",
-        {"target": "backend", "test_path": "test_module.py"},
+        {"scope_id": "test-scope", "target": "backend", "test_path": "test_module.py"},
         trace_id=trace_id,
     )
     assert tested["status"] == "ok", tested
     assert tested["result"]["exit_code"] == 0, tested
-    assert broker.invoke("git_status", trace_id=trace_id)["status"] == "ok"
+    assert broker.invoke("git_status", {"scope_id": "test-scope"}, trace_id=trace_id)["status"] == "ok"
     committed = broker.invoke(
         "git_commit",
-        {"message": "verify developer workflow", "paths": ["backend/module.py"]},
+        {
+            "scope_id": "test-scope",
+            "message": "verify developer workflow",
+            "paths": ["backend/module.py"],
+        },
         trace_id=trace_id,
     )
     assert committed["status"] == "ok", committed
-    assert broker.invoke("git_status", trace_id=trace_id)["status"] == "ok"
+    assert broker.invoke("git_status", {"scope_id": "test-scope"}, trace_id=trace_id)["status"] == "ok"
 
     traced_tools = {row["tool"] for row in broker.store.audit_rows(200) if row["trace_id"] == trace_id}
     assert {"list_scopes", "workspace_snapshot", "apply_patch", "run_targeted_test", "git_commit"} <= traced_tools

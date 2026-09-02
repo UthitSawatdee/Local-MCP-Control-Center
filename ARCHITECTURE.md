@@ -177,19 +177,22 @@ MCP bridge เปิดเฉพาะ Tool ที่อยู่ใน registry
 | filesystem | `rename_file` | ปิด | same scope, no directory tree rename ใน MVP |
 | filesystem | `move_file` | ปิด | ต้องผ่าน source/destination checks |
 | filesystem | `delete_file` | ปิด | ไม่ recursive; approval เสมอ |
+| documents | `read_csv` | เปิด | อ่าน UTF-8 CSV แบบ structured; จำกัด row/column และ redaction |
 | documents | `csv_transform` | ปิด | operation enum ไม่รับ Python/expression |
 | documents | `xlsx_edit` | ปิด | sheet/range/cell operation enum |
 | documents | `docx_edit` | ปิด | paragraph/table operation enum |
-| project | `git_status` | เปิด | read-only |
-| project | `git_diff` | เปิด | read-only, path relative |
-| project | `git_log` | เปิด | จำกัดจำนวน commit |
-| project | `run_backend_test` | ปิด | fixed profile, approval เสมอใน MVP |
-| project | `run_frontend_test` | ปิด | fixed profile, approval เสมอใน MVP |
-| project | `run_build` | ปิด | fixed profile, approval เสมอใน MVP |
+| project | `git_status` | เปิด | read-only, ต้องระบุ `scope_id` |
+| project | `git_diff` | เปิด | read-only, ต้องระบุ `scope_id` |
+| project | `git_log` | เปิด | จำกัดจำนวน commit, ต้องระบุ `scope_id` |
+| project | `run_backend_test` | ปิด | fixed profile, ต้องระบุ `scope_id` |
+| project | `run_frontend_test` | ปิด | fixed profile, ต้องระบุ `scope_id` |
+| project | `run_build` | ปิด | fixed profile, ต้องระบุ `scope_id` |
 | control | `runtime_status` | เปิด | สถานะเท่านั้น ไม่มี start/stop จาก ChatGPT |
 | control | `apply_approved_action` | เปิดแบบจำกัด | ใช้ได้เฉพาะ approval ที่ GUI อนุมัติและยัง valid |
 
 ไม่มี Tool ชื่อ `shell`, `exec`, `run_command`, `python`, `node_eval` หรือ `docker` ใน registry
+
+Project-bound Git และ test/build tools ต้องรับ `scope_id` แบบ explicit ในทุก request เช่น `git_status(scope_id="project-atm-coperation")` และ `run_targeted_test(scope_id="project-atm-coperation", target="backend")`. Broker ตรวจ scope ที่ caller เลือกให้เป็น project ที่เปิดเผยและตรวจ capability ก่อนส่ง canonical root ให้ fixed adapter; จะไม่เลือก project จาก singleton visible-scope heuristic อีกต่อไป จึงรองรับ MCP requests จากหลาย project พร้อมกันได้โดยไม่ปะปนกัน
 
 ### Approval flow
 
@@ -458,6 +461,7 @@ Test/build ไม่ใช่ arbitrary shell แต่ยังเป็น cod
 
 - operations: inspect, select rows, append rows, update cells, sort by declared columns, rename columns
 - รองรับ UTF-8/BOM และ encoding ที่ระบุชัด
+- `read_csv` คืน bounded row arrays พร้อม total row/column counts, one-based `start_row`, truncation flags และ content hash; ไม่เขียนไฟล์
 - preserve delimiter/newline เมื่อทำได้; รายงานเมื่อ format เปลี่ยน
 - ป้องกัน CSV formula injection โดย neutralize ค่าเริ่มต้นที่ขึ้นต้นด้วย `=`, `+`, `-`, `@`; การเขียนสูตรต้องเป็น option explicit + approval
 - แสดง row/cell diff ก่อน overwrite
@@ -892,7 +896,7 @@ The role profile is persisted as an `AgentCapabilityContext`. The provider recei
 
 ### Provider and runtime boundary
 
-`AgentModelProvider` exposes only `run_agent(...)` and `cancel(...)`. The runtime ships a fixed-endpoint `OpenAIChatProvider` adapter that reads `OPENAI_API_KEY` from local process configuration and uses `LOCAL_MCP_AGENT_MODEL` (default `gpt-5.6-luna`); `FakeModelProvider` supplies deterministic tests. Additional providers can be registered through the trusted local `AgentModelProfile` control-plane seam. MCP task input can select only a configured profile name; it cannot provide credentials, endpoint, executable, argv, environment, cwd or raw system prompt.
+`AgentModelProvider` exposes only `run_agent(...)` and `cancel(...)`. The runtime ships a fixed-endpoint `OpenAIChatProvider` adapter that reads `OPENAI_API_KEY` from local process configuration and uses `LOCAL_MCP_AGENT_MODEL` (default `gpt-5.6-luna`) plus `LOCAL_MCP_AGENT_REASONING_EFFORT` (default `max`); `FakeModelProvider` supplies deterministic tests. Additional providers can be registered through the trusted local `AgentModelProfile` control-plane seam. MCP task input can select only a configured profile name; it cannot provide credentials, endpoint, executable, argv, environment, cwd or raw system prompt.
 
 `AgentRuntimeService` owns task threads, cancellation events, provider invocation, result normalization, restart recovery and runtime limits. SQLite tables `agent_tasks` and `agent_results` are additive to the existing Store and persist state across MCP request boundaries. Incomplete tasks found at startup become `failed` with `RUNTIME_RESTARTED`; the runtime does not silently retry.
 
@@ -907,3 +911,11 @@ Every lifecycle transition and worktree creation is written to the existing reda
 ### Existing compatibility and deferred scope
 
 The original MCP tools and the earlier fixed-profile delegated-agent compatibility path remain registered; the provider-backed API is additive. The runtime uses local threads and fixed/scrubbed adapters, not an OS-level hostile-code sandbox. Automatic merge/push, autonomous planning, child MCP/desktop automation, distributed workers, queue infrastructure, Motion-specific browser business adapters and unrelated MRP changes remain out of scope for V1. Generic Browser Automation V1 is documented in `docs/BROWSER_AUTOMATION.md` and remains behind the existing Broker/audit path.
+
+## 18. Actual DevOS WorkspaceEngine Foundation
+
+The checkout now includes a Python `WorkspaceEngine` deep module behind the existing `Broker`. It owns the semantic contract for `observe`, `prepare`, `record`, and `finish`; MCP, CLI, and the read-only Tkinter health view remain thin adapters. `ProjectRegistry` reuses canonical project scopes instead of introducing a second project table.
+
+The additive SQLite model persists validated Capsules, bounded Snapshots with environment fingerprints, WorkRuns, append-only Evidence receipts, and immutable Handoff reports. Observation uses fixed Git/runtime probes, localhost port checks, bounded filesystem metadata, duplicate-scope detection, tracked-environment warnings, and Capsule drift. It never reads protected file contents and does not expose repository roots through the public workspace snapshot.
+
+The foundation deliberately stops before controlled operations: no new shell surface, service mutation, database mutation, cleanup, commit, push, merge, or automatic repair was added. `Broker` still performs scope, capability, tool-policy, and audit checks; dangerous actions continue to use the existing approval records. Implementation detail and resume state are in `docs/DEVOS_IMPLEMENTATION_PLAN.md` and `.agents/runtime/devos-20260901.yml`.

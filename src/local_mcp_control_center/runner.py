@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import os
 import json
+import os
 import subprocess
 import time
 from dataclasses import dataclass
@@ -237,6 +237,64 @@ class FixedRunner:
 
     def available_profiles(self, project_root: Path) -> list[dict[str, Any]]:
         return [profile.to_dict() for profile in self.profile_registry.detect(project_root).values()]
+
+    def inspect_runtime_versions(self, project_root: Path) -> dict[str, dict[str, Any]]:
+        """Probe only fixed runtime ``--version`` commands.
+
+        This is intentionally separate from project command profiles.  The
+        WorkspaceEngine may observe local runtime drift, but callers cannot
+        provide an executable, arguments, environment, or shell command.
+        """
+        executables: dict[str, str] = {}
+        for name, executable_name in (
+            ("python", "python3"),
+            ("node", "node"),
+            ("npm", "npm"),
+            ("git", "git"),
+            ("postgres", "psql"),
+        ):
+            try:
+                executables[name] = self._trusted_executable(executable_name)
+            except PolicyError:
+                continue
+        result: dict[str, dict[str, Any]] = {}
+        for name, executable in executables.items():
+            command = self._run_argv(
+                f"runtime_version:{name}",
+                [executable, "--version"],
+                self.runtime_home,
+                output_limit=256,
+                timeout_seconds=10,
+            )
+            version = (command.stdout or command.stderr).splitlines()[0][:120] if (command.stdout or command.stderr) else None
+            result[name] = {
+                "state": "available" if command.exit_code == 0 and not command.timed_out else "unavailable",
+                "version": version,
+                "exit_code": command.exit_code,
+                "timed_out": command.timed_out,
+            }
+        return result
+
+    def tracked_paths(self, project_root: Path) -> list[str]:
+        """Return bounded tracked filenames only; never reads file contents."""
+        command = self._run_argv(
+            "git_tracked_paths",
+            self._git(["ls-files", "-z", "--cached"]),
+            project_root,
+            output_limit=1_048_576,
+            timeout_seconds=30,
+        )
+        if command.stdout_truncated or command.stderr_truncated:
+            raise PolicyError("GIT_OUTPUT_TRUNCATED", "tracked path inventory was truncated")
+        if command.exit_code != 0 or command.timed_out:
+            return []
+        if command.stdout and not command.stdout.endswith("\x00"):
+            raise PolicyError("GIT_OUTPUT_TRUNCATED", "tracked path inventory was incomplete")
+        paths = [item for item in command.stdout.split("\x00") if item and not item.startswith("/")]
+        unique_paths = sorted(set(paths))
+        if len(unique_paths) > 10_000:
+            raise PolicyError("GIT_OUTPUT_TRUNCATED", "tracked path inventory exceeds the metadata limit")
+        return unique_paths
 
     def _run_argv(
         self,

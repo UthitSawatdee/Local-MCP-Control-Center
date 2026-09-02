@@ -8,10 +8,16 @@ from pathlib import Path
 from typing import Any
 
 from .errors import PolicyError
+from .filesystem import redact_text
 
 
 CELL_RE = re.compile(r"^[A-Z]{1,3}[1-9][0-9]*$")
 INVALID_SHEET_NAME_CHARS = set("[]:*?/\\")
+CSV_DELIMITERS = (",", ";", "\t", "|")
+MAX_CSV_BYTES = 20 * 1024 * 1024
+MAX_CSV_START_ROW = 50_000_000
+MAX_CSV_ROWS = 1_000
+MAX_CSV_COLUMNS = 200
 
 
 def _safe_cell(cell: str) -> str:
@@ -41,6 +47,58 @@ def _safe_sheet_name(value: Any) -> str:
 
 class DocumentAdapter:
     """Format-specific adapter with explicit operations and no script evaluation."""
+
+    def read_csv(
+        self,
+        target: Path,
+        *,
+        start_row: int = 1,
+        max_rows: int = 200,
+        max_columns: int = 50,
+        delimiter: str = ",",
+        max_bytes: int = MAX_CSV_BYTES,
+    ) -> dict[str, Any]:
+        """Read a bounded, redacted slice of a UTF-8 CSV file."""
+
+        if not isinstance(start_row, int) or isinstance(start_row, bool) or not 1 <= start_row <= MAX_CSV_START_ROW:
+            raise PolicyError("INVALID_INPUT", f"start_row must be between 1 and {MAX_CSV_START_ROW}")
+        if not isinstance(max_rows, int) or isinstance(max_rows, bool) or not 1 <= max_rows <= MAX_CSV_ROWS:
+            raise PolicyError("INVALID_INPUT", f"max_rows must be between 1 and {MAX_CSV_ROWS}")
+        if not isinstance(max_columns, int) or isinstance(max_columns, bool) or not 1 <= max_columns <= MAX_CSV_COLUMNS:
+            raise PolicyError("INVALID_INPUT", f"max_columns must be between 1 and {MAX_CSV_COLUMNS}")
+        if delimiter not in CSV_DELIMITERS:
+            raise PolicyError("INVALID_INPUT", "delimiter must be one of ',', ';', tab, or '|'")
+
+        rows, encoding, newline = self._read_csv(
+            target,
+            max_bytes=max_bytes,
+            delimiter=delimiter,
+        )
+        total_rows = len(rows)
+        total_columns = max((len(row) for row in rows), default=0)
+        start_index = start_row - 1
+        selected_rows = rows[start_index:start_index + max_rows]
+        returned_rows = [
+            [redact_text(value) for value in row[:max_columns]]
+            for row in selected_rows
+        ]
+        rows_truncated = start_index + len(selected_rows) < total_rows
+        columns_truncated = total_columns > max_columns
+        return {
+            "format": "csv",
+            "encoding": encoding,
+            "newline": newline,
+            "delimiter": delimiter,
+            "row_count": total_rows,
+            "column_count": total_columns,
+            "start_row": start_row,
+            "end_row": start_row + len(selected_rows) - 1 if selected_rows else None,
+            "rows": returned_rows,
+            "truncated": rows_truncated or columns_truncated,
+            "rows_truncated": rows_truncated,
+            "columns_truncated": columns_truncated,
+            "has_more": rows_truncated,
+        }
 
     def inspect_csv(self, target: Path) -> dict[str, Any]:
         rows, encoding, newline = self._read_csv(target)
@@ -116,18 +174,33 @@ class DocumentAdapter:
                 raise PolicyError("INVALID_INPUT", "each row must contain at most 500 values")
 
     @staticmethod
-    def _read_csv(target: Path) -> tuple[list[list[str]], str, str]:
+    def _read_csv(
+        target: Path,
+        *,
+        max_bytes: int = MAX_CSV_BYTES,
+        delimiter: str = ",",
+    ) -> tuple[list[list[str]], str, str]:
+        if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes < 1:
+            raise PolicyError("INVALID_INPUT", "CSV byte limit must be a positive integer")
+        if delimiter not in CSV_DELIMITERS:
+            raise PolicyError("INVALID_INPUT", "delimiter must be one of ',', ';', tab, or '|'")
+        limit = min(max_bytes, MAX_CSV_BYTES)
+        if target.stat().st_size > limit:
+            raise PolicyError("QUOTA_EXCEEDED", f"CSV exceeds the {limit} byte read limit")
         raw = target.read_bytes()
-        if len(raw) > 20 * 1024 * 1024:
-            raise PolicyError("QUOTA_EXCEEDED", "CSV exceeds the 20 MB adapter limit")
+        if len(raw) > limit:
+            raise PolicyError("QUOTA_EXCEEDED", f"CSV exceeds the {limit} byte read limit")
         encoding = "utf-8-sig" if raw.startswith(b"\xef\xbb\xbf") else "utf-8"
         try:
             text = raw.decode(encoding)
         except UnicodeDecodeError as exc:
             raise PolicyError("FORMAT_UNSUPPORTED", "CSV must be UTF-8 or UTF-8 with BOM") from exc
         newline = "\r\n" if "\r\n" in text else "\n"
-        reader = csv.reader(io.StringIO(text, newline=""))
-        rows = [row for row in reader]
+        reader = csv.reader(io.StringIO(text, newline=""), delimiter=delimiter)
+        try:
+            rows = [row for row in reader]
+        except csv.Error as exc:
+            raise PolicyError("FORMAT_VALIDATION_FAILED", f"unable to parse CSV: {exc}") from exc
         return rows, encoding, newline
 
     def edit_xlsx(self, target: Path, payload: dict[str, Any]) -> tuple[bytes, dict[str, Any]]:

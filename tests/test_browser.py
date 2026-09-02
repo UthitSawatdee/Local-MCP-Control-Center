@@ -8,7 +8,13 @@ from typing import Any
 
 import pytest
 
-from local_mcp_control_center.browser import BrowserManager, BrowserProfilePolicy
+from local_mcp_control_center.browser import (
+    BROWSER_PROFILES,
+    LEGACY_BROWSER_PROFILE_NAME,
+    LOCAL_BROWSER_PROFILE_NAME,
+    BrowserManager,
+    BrowserProfilePolicy,
+)
 from local_mcp_control_center.errors import PolicyError
 from local_mcp_control_center.mcp_server import build_server
 
@@ -108,12 +114,51 @@ def _ref_containing(snapshot: str, text: str) -> str:
 
 def test_browser_registry_and_mcp_registration(broker) -> None:
     names = {name for name in ("browser_open", "browser_snapshot", "browser_run_command", "browser_close")}
-    enable_tools(broker, *names)
     server = build_server(broker)
     registered = {tool.name for tool in server._tool_manager.list_tools()}
     assert names <= registered
     browser_tool = next(tool for tool in server._tool_manager.list_tools() if tool.name == "browser_run_command")
     assert "command" not in browser_tool.fn_metadata.arg_model.model_fields
+
+
+def test_browser_tools_are_enabled_by_default(broker) -> None:
+    names = ("browser_open", "browser_snapshot", "browser_run_command", "browser_close")
+
+    assert all(broker.store.get_tool_policy(name).enabled for name in names)
+
+
+def test_motion_profile_allows_web_internet_and_reports_policy(tmp_path: Path) -> None:
+    manager = BrowserManager(tmp_path / "browser", headless=True)
+    profile = BROWSER_PROFILES[LOCAL_BROWSER_PROFILE_NAME]
+
+    assert profile.allow_internet is True
+    for url in (
+        "https://example.com/",
+        "https://fonts.googleapis.com/css2?family=Inter",
+        "https://www.googletagmanager.com/gtm.js",
+        "https://connect.facebook.net/en_US/fbevents.js",
+    ):
+        assert manager._url_allowed(profile, url)
+    assert not manager._url_allowed(profile, "file:///tmp/private.txt")
+    assert not manager._url_allowed(profile, "javascript:alert(1)")
+
+    status = manager.status()
+    motion_status = next(item for item in status["profiles"] if item["profile"] == LOCAL_BROWSER_PROFILE_NAME)
+    assert motion_status["internet_access"] is True
+
+
+def test_local_profile_renames_legacy_persistent_directory(tmp_path: Path) -> None:
+    if LOCAL_BROWSER_PROFILE_NAME == LEGACY_BROWSER_PROFILE_NAME:
+        pytest.skip("local hostname is the legacy profile name")
+    legacy_dir = tmp_path / "browser" / LEGACY_BROWSER_PROFILE_NAME
+    legacy_dir.mkdir(parents=True)
+    (legacy_dir / "profile-marker").write_text("preserve", encoding="utf-8")
+
+    manager = BrowserManager(tmp_path / "browser", headless=True)
+
+    assert not legacy_dir.exists()
+    assert (tmp_path / "browser" / LOCAL_BROWSER_PROFILE_NAME / "profile-marker").read_text(encoding="utf-8") == "preserve"
+    manager.close_all()
 
 
 def test_browser_schema_rejects_raw_code_and_invalid_action(broker) -> None:
@@ -147,7 +192,7 @@ def test_browser_broker_call_is_audited(broker, monkeypatch) -> None:
             "authenticated": None,
         },
     )
-    result = broker.invoke("browser_open", {"profile": "motion-erp"})
+    result = broker.invoke("browser_open", {"profile": LOCAL_BROWSER_PROFILE_NAME})
     assert result["status"] == "ok"
     row = broker.store.audit_rows(1)[0]
     assert row["tool"] == "browser_open"

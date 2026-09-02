@@ -34,12 +34,14 @@ from .registry import DEFAULT_REGISTRY, ToolRegistry
 from .runner import FixedRunner
 from .schemas import validate_tool_args
 from .storage import Store
+from .workspace_engine import WorkEvent, WorkRequest, WorkspaceEngine, WorkspaceScope
 
 
 _COMPOUND_READ_TOOLS = frozenset(
     {
         "list_files",
         "read_file",
+        "read_csv",
         "search_text",
         "read_many_files",
         "find_files",
@@ -53,6 +55,35 @@ _COMPOUND_READ_TOOLS = frozenset(
         "dependency_graph",
     }
 )
+
+_PROJECT_SCOPE_TOOLS = frozenset(
+    {
+        "git_status",
+        "git_diff",
+        "git_log",
+        "git_create_branch",
+        "git_stage_paths",
+        "git_commit",
+        "git_restore_file",
+        "git_push",
+        "run_backend_test",
+        "run_frontend_test",
+        "run_targeted_test",
+        "run_lint",
+        "run_typecheck",
+        "run_build",
+    }
+)
+
+_ACTIVE_RUNTIME_STATES = frozenset({"starting", "running", "healthy", "ready", "unhealthy"})
+_WORKSPACE_CONTROLLED_ACTION_TOOLS = {
+    "owned_service_start": "process_start_profile",
+    "owned_service_stop": "process_stop",
+    "targeted_verification": "run_targeted_test",
+    "commit": "git_commit",
+    "push": "git_push",
+}
+_WORKSPACE_APPROVAL_TOOLS = frozenset(_WORKSPACE_CONTROLLED_ACTION_TOOLS.values())
 
 
 @dataclass(slots=True)
@@ -100,6 +131,7 @@ class Broker:
         )
         self.index = WorkspaceIndexService(self.store, self.filesystem)
         self.context_engine = WorkspaceContextService(self.filesystem, self.index)
+        self.workspace_engine = WorkspaceEngine(self.store, self.runner, self.filesystem, self.audit)
         self.context_ledger = ContextLedger()
         self.compound_reads = CompoundReadExecutor(
             {
@@ -209,7 +241,12 @@ class Broker:
                 target_display=tool_name,
                 metadata={"enabled": policy.enabled, "approval_mode": policy.approval_mode, "policy_version": version},
             )
-            return {"status": "ok", "policy": policy.to_dict(), "policy_version": version}
+            return {
+                "status": "ok",
+                "policy": policy.to_dict(),
+                "policy_version": version,
+                "bridge": self.bridge_status(),
+            }
         except StorageError as exc:
             return {"status": "denied", "error_code": "STORAGE_ERROR", "message": str(exc)}
 
@@ -301,6 +338,90 @@ class Broker:
     def verify_audit(self) -> dict[str, Any]:
         valid, message = self.audit.verify_chain()
         return {"valid": valid, "message": message}
+
+    def bridge_status(self) -> dict[str, Any]:
+        """Return the current catalog, policy, and running bridge snapshot."""
+        definitions = self.registry.all()
+        policies = {policy.tool_name: policy for policy in self.store.list_tool_policies()}
+        registry_total = len(definitions)
+        enabled_count = sum(
+            bool(policy := policies.get(definition.name)) and policy.enabled
+            for definition in definitions
+        )
+        policy_version = self.store.policy_version()
+        snapshot = self.store.get_mcp_bridge_snapshot()
+        snapshot_pid = snapshot.get("pid") if snapshot else None
+        snapshot_policy_version = snapshot.get("policy_version") if snapshot else None
+        snapshot_tool_count = snapshot.get("tool_count") if snapshot else 0
+        snapshot_valid = (
+            isinstance(snapshot_pid, int)
+            and not isinstance(snapshot_pid, bool)
+            and snapshot_pid > 0
+            and isinstance(snapshot_policy_version, int)
+            and not isinstance(snapshot_policy_version, bool)
+            and snapshot_policy_version >= 0
+            and isinstance(snapshot_tool_count, int)
+            and not isinstance(snapshot_tool_count, bool)
+            and snapshot_tool_count >= 0
+        )
+        snapshot_alive = snapshot_valid and self._pid_is_alive(snapshot_pid)
+        mcp_runtime = self.store.get_runtime("mcp_bridge")
+        tunnel_runtime = self.store.get_runtime("tunnel")
+        runtime_active = any(
+            self._runtime_process_is_active(runtime)
+            for runtime in (mcp_runtime, tunnel_runtime)
+        )
+
+        stale = bool(runtime_active and not snapshot_alive)
+        if snapshot_alive:
+            stale = snapshot_policy_version != policy_version
+        state = "stale" if stale else "ready" if snapshot_alive else "starting" if runtime_active else "stopped"
+        return {
+            "state": state,
+            "stale": stale,
+            "registry_total": registry_total,
+            "enabled_count": enabled_count,
+            "running_tool_count": snapshot_tool_count if snapshot_alive else 0,
+            "policy_version": policy_version,
+            "running_policy_version": snapshot_policy_version if snapshot_alive else None,
+            "pid": snapshot_pid if snapshot_alive else None,
+            "started_at": snapshot.get("started_at") if snapshot_alive and snapshot else None,
+        }
+
+    def record_mcp_bridge_snapshot(self, tool_count: int) -> None:
+        self.store.set_mcp_bridge_snapshot(
+            {
+                "pid": os.getpid(),
+                "tool_count": tool_count,
+                "policy_version": self.store.policy_version(),
+                "started_at": utc_now(),
+            }
+        )
+
+    def clear_mcp_bridge_snapshot(self) -> None:
+        # PID matching prevents an older bridge process from clearing a newer
+        # snapshot after a quick stop/start cycle.
+        self.store.clear_mcp_bridge_snapshot(pid=os.getpid())
+
+    @staticmethod
+    def _pid_is_alive(pid: Any) -> bool:
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
+
+    @classmethod
+    def _runtime_process_is_active(cls, runtime: dict[str, Any] | None) -> bool:
+        return bool(
+            runtime
+            and runtime.get("state") in _ACTIVE_RUNTIME_STATES
+            and cls._pid_is_alive(runtime.get("pid"))
+        )
 
     def tool_rows(self) -> list[dict[str, Any]]:
         policies = {policy.tool_name: policy for policy in self.store.list_tool_policies()}
@@ -489,6 +610,46 @@ class Broker:
         text, digest = self.filesystem.read_text(target, max_bytes=min(MAX_READ_BYTES, int(permission["max_bytes"])))
         self._audit_success(context, "read_file", "read", f"{scope_id}:{display}", scope_id=scope_id, pre_hash=digest, metadata={"bytes": len(text.encode("utf-8"))})
         return {"status": "ok", "scope_id": scope_id, "relative_path": display, "content": text, "content_hash": digest}
+
+    def _tool_read_csv(self, args: dict[str, Any], context: RequestContext) -> dict[str, Any]:
+        scope_id = self._require_string(args, "scope_id")
+        relative = self._require_string(args, "relative_path")
+        scope, target, display = self.policy.resolve_path(scope_id, relative, actor=context.actor, must_exist=True)
+        if not target.is_file():
+            raise PolicyError("NOT_A_FILE", "read_csv only handles one regular file")
+        if target.suffix.lower() != ".csv":
+            raise PolicyError("FORMAT_UNSUPPORTED", "read_csv only supports .csv files")
+        _, permission = self.policy.require_capability(scope_id, Capability.READ, actor=context.actor)
+        result = self.documents.read_csv(
+            target,
+            start_row=self._bounded_int(args.get("start_row", 1), 1, 50_000_000),
+            max_rows=self._bounded_int(args.get("max_rows", 200), 1, 1_000),
+            max_columns=self._bounded_int(args.get("max_columns", 50), 1, 200),
+            delimiter=args.get("delimiter", ","),
+            max_bytes=min(MAX_READ_BYTES, int(permission["max_bytes"])),
+        )
+        digest = sha256_file(target)
+        self._audit_success(
+            context,
+            "read_csv",
+            "read",
+            f"{scope_id}:{display}",
+            scope_id=scope_id,
+            pre_hash=digest,
+            metadata={
+                "row_count": result["row_count"],
+                "column_count": result["column_count"],
+                "returned_rows": len(result["rows"]),
+                "truncated": result["truncated"],
+            },
+        )
+        return {
+            "status": "ok",
+            "scope_id": scope_id,
+            "relative_path": display,
+            "content_hash": digest,
+            **result,
+        }
 
     def _tool_search_text(self, args: dict[str, Any], context: RequestContext) -> dict[str, Any]:
         scope_id = self._require_string(args, "scope_id")
@@ -1001,16 +1162,16 @@ class Broker:
         )
 
     def _tool_git_status(self, args: dict[str, Any], context: RequestContext) -> dict[str, Any]:
-        return self._project_read(context, "git_status", "git_status")
+        return self._project_read(args, context, "git_status", "git_status")
 
     def _tool_git_diff(self, args: dict[str, Any], context: RequestContext) -> dict[str, Any]:
-        return self._project_read(context, "git_diff", "git_diff")
+        return self._project_read(args, context, "git_diff", "git_diff")
 
     def _tool_git_log(self, args: dict[str, Any], context: RequestContext) -> dict[str, Any]:
-        return self._project_read(context, "git_log", "git_log")
+        return self._project_read(args, context, "git_log", "git_log")
 
     def _tool_git_create_branch(self, args: dict[str, Any], context: RequestContext) -> dict[str, Any]:
-        scope_id, scope, permission = self._git_execution_scope(context)
+        scope_id, scope, permission = self._git_execution_scope(args, context)
         branch = self.git.validate_branch(self._require_string(args, "branch"))
         payload = {"scope_id": scope_id, "branch": branch}
         return self._authorize_mutation(
@@ -1025,7 +1186,7 @@ class Broker:
         )
 
     def _tool_git_stage_paths(self, args: dict[str, Any], context: RequestContext) -> dict[str, Any]:
-        scope_id, scope, permission = self._git_execution_scope(context)
+        scope_id, scope, permission = self._git_execution_scope(args, context)
         paths = self.git.validate_paths(args.get("paths"))
         expected = self._git_path_preconditions(scope_id, paths, context)
         payload = {"scope_id": scope_id, "paths": paths}
@@ -1041,7 +1202,7 @@ class Broker:
         )
 
     def _tool_git_commit(self, args: dict[str, Any], context: RequestContext) -> dict[str, Any]:
-        scope_id, scope, permission = self._git_execution_scope(context)
+        scope_id, scope, permission = self._git_execution_scope(args, context)
         message = self.git.commit_message(self._require_string(args, "message"))
         paths = self.git.validate_paths(args.get("paths"))
         expected = self._git_path_preconditions(scope_id, paths, context)
@@ -1058,7 +1219,7 @@ class Broker:
         )
 
     def _tool_git_restore_file(self, args: dict[str, Any], context: RequestContext) -> dict[str, Any]:
-        scope_id, scope, permission = self._git_execution_scope(context)
+        scope_id, scope, permission = self._git_execution_scope(args, context)
         path = self._require_string(args, "path")
         self._validate_git_paths(scope_id, [path], context, allow_missing=True)
         _, target, display = self.policy.resolve_path(scope_id, path, actor=context.actor, must_exist=False)
@@ -1079,7 +1240,7 @@ class Broker:
         )
 
     def _tool_git_push(self, args: dict[str, Any], context: RequestContext) -> dict[str, Any]:
-        scope_id, scope, permission = self._git_execution_scope(context)
+        scope_id, scope, permission = self._git_execution_scope(args, context)
         remote = self.git.validate_remote(str(args.get("remote", "origin")))
         branch_value = args.get("branch")
         branch = self.git.validate_branch(branch_value) if branch_value is not None else None
@@ -1089,6 +1250,10 @@ class Broker:
             branch = current_branch
         if not branch:
             raise PolicyError("GIT_BRANCH_REQUIRED", "push requires a current or explicit branch")
+        head_result = self.git.run("current_head", Path(scope.root), ["rev-parse", "--verify", "HEAD"])
+        head = self.git.current_head(head_result)
+        if not head:
+            raise PolicyError("GIT_HEAD_REQUIRED", "push requires a resolvable HEAD commit")
         payload = {"scope_id": scope_id, "remote": remote, "branch": branch}
         return self._authorize_mutation(
             context,
@@ -1097,15 +1262,31 @@ class Broker:
             scope_id=scope_id,
             targets=[f"{remote}/{branch}"],
             payload=payload,
-            expected={"branch": current_branch, "project_root": sha256_json({"root": scope.root})},
+            expected={"branch": current_branch, "head": head, "project_root": sha256_json({"root": scope.root})},
             permission=permission,
         )
 
-    def _git_execution_scope(self, context: RequestContext) -> tuple[str, Any, dict[str, Any]]:
-        scope_id = self._project_scope_id()
-        scope, permission = self.policy.require_execution(scope_id, actor=context.actor)
+    def _require_project_scope(self, args: dict[str, Any], context: RequestContext) -> tuple[str, Any]:
+        """Resolve the explicitly selected MCP project scope.
+
+        Project-bound tools must carry their scope in every request.  This is
+        intentionally separate from ``_project_scope_id`` which remains only
+        for legacy convenience tools whose scope is optional.
+        """
+
+        scope_id = self._require_string(args, "scope_id")
+        scope = self.policy.get_scope(scope_id, actor=context.actor)
         if scope.kind != ScopeKind.PROJECT:
-            raise PolicyError("INVALID_SCOPE", "Git mutation requires a project scope")
+            raise PolicyError("INVALID_SCOPE", "project tools require a project scope")
+        return scope_id, scope
+
+    def _git_execution_scope(
+        self,
+        args: dict[str, Any],
+        context: RequestContext,
+    ) -> tuple[str, Any, dict[str, Any]]:
+        scope_id, scope = self._require_project_scope(args, context)
+        scope, permission = self.policy.require_execution(scope_id, actor=context.actor)
         return scope_id, scope, permission
 
     def _validate_git_paths(
@@ -1138,11 +1319,15 @@ class Broker:
             expected[f"path:{display}"] = sha256_file(target) if target.is_file() else None
         return expected
 
-    def _project_read(self, context: RequestContext, tool: str, profile: str) -> dict[str, Any]:
-        scope_id = self._project_scope_id()
+    def _project_read(
+        self,
+        args: dict[str, Any],
+        context: RequestContext,
+        tool: str,
+        profile: str,
+    ) -> dict[str, Any]:
+        scope_id, scope = self._require_project_scope(args, context)
         scope, _ = self.policy.require_capability(scope_id, Capability.READ, actor=context.actor)
-        if scope.kind != ScopeKind.PROJECT:
-            raise PolicyError("INVALID_SCOPE", "git tools require a project scope")
         tool_policy = self.store.get_tool_policy(tool)
         if tool_policy is None:
             raise PolicyError("TOOL_NOT_FOUND", f"tool policy is missing: {tool}")
@@ -1306,6 +1491,328 @@ class Broker:
             metadata={"top_level_count": len(result.get("top_level", []))},
         )
         return result
+
+    def _tool_workspace_observe(self, args: dict[str, Any], context: RequestContext) -> dict[str, Any]:
+        scope, workspace_scope = self._workspace_project_scope(args.get("project_id"), context)
+        result = self.workspace_engine.observe(
+            workspace_scope,
+            max_items=self._bounded_int(args.get("max_items", 100), 1, 500),
+        )
+        self._audit_success(
+            context,
+            "workspace_observe",
+            "observe",
+            scope.id,
+            scope_id=scope.id,
+            metadata={
+                "snapshot_id": result.get("snapshot_id"),
+                "warning_count": len(result.get("warnings", [])),
+                "changed_file_count": result.get("git", {}).get("changed_file_count", 0),
+            },
+        )
+        return {"status": "ok", **result}
+
+    def _tool_workspace_prepare(self, args: dict[str, Any], context: RequestContext) -> dict[str, Any]:
+        scope, _ = self._workspace_project_scope(args.get("project_id"), context)
+        allowed = args.get("allowed_scope", ["."])
+        if not isinstance(allowed, list) or not all(isinstance(item, str) for item in allowed):
+            raise PolicyError("INVALID_INPUT", "allowed_scope must be a list of relative paths")
+        try:
+            package = self.workspace_engine.prepare(
+                WorkRequest(
+                    project_id=scope.id,
+                    goal=self._require_string(args, "goal"),
+                    mode=str(args.get("mode", "implement")),
+                    allowed_scope=tuple(allowed),
+                )
+            )
+        except ValueError as exc:
+            raise PolicyError("INVALID_INPUT", str(exc)) from exc
+        self._audit_success(
+            context,
+            "workspace_prepare",
+            "prepare",
+            f"{scope.id}:{package['run_id']}",
+            scope_id=scope.id,
+            metadata={"mode": package.get("mode"), "risk": package.get("risk"), "run_id": package.get("run_id")},
+        )
+        return {"status": "ok", "work_package": package}
+
+    def _tool_workspace_run_status(self, args: dict[str, Any], context: RequestContext) -> dict[str, Any]:
+        run_id = self._require_string(args, "run_id")
+        row = self.store.get_workspace_run(run_id)
+        if row is None:
+            raise PolicyError("RUN_NOT_FOUND", "workspace run was not found")
+        scope = self.store.get_scope(str(row.get("scope_id")))
+        if scope is None:
+            raise PolicyError("RUN_SCOPE_UNKNOWN", "workspace run has no registered project")
+        self.policy.require_capability(scope.id, Capability.READ, actor=context.actor)
+        try:
+            result = self.workspace_engine.run_status(run_id)
+        except ValueError as exc:
+            raise PolicyError("RUN_NOT_FOUND", str(exc)) from exc
+        self._audit_success(
+            context,
+            "workspace_run_status",
+            "run_status",
+            run_id,
+            scope_id=scope.id,
+            metadata={"state": row.get("status"), "evidence_count": len(result.get("evidence", []))},
+        )
+        return result
+
+    def _tool_workspace_finish(self, args: dict[str, Any], context: RequestContext) -> dict[str, Any]:
+        run_id = self._require_string(args, "run_id")
+        row = self.store.get_workspace_run(run_id)
+        if row is None:
+            raise PolicyError("RUN_NOT_FOUND", "workspace run was not found")
+        scope = self.store.get_scope(str(row.get("scope_id")))
+        if scope is None:
+            raise PolicyError("RUN_SCOPE_UNKNOWN", "workspace run has no registered project")
+        self.policy.require_capability(scope.id, Capability.READ, actor=context.actor)
+        try:
+            report = self.workspace_engine.finish(run_id)
+        except ValueError as exc:
+            raise PolicyError("RUN_NOT_FOUND", str(exc)) from exc
+        self._audit_success(
+            context,
+            "workspace_finish",
+            "finish",
+            run_id,
+            scope_id=scope.id,
+            metadata={"verified": report.get("verification", {}).get("verified", False), "evidence_count": report.get("evidence_count", 0)},
+        )
+        return {"status": "ok", "handoff": report}
+
+    def _tool_workspace_action_proposals(self, args: dict[str, Any], context: RequestContext) -> dict[str, Any]:
+        project_id = args.get("project_id")
+        if project_id is not None and not isinstance(project_id, str):
+            raise PolicyError("INVALID_INPUT", "project_id must be text")
+        if project_id:
+            scope, _ = self._workspace_project_scope(project_id, context)
+            proposals = self.workspace_engine.action_proposals(scope.id)
+        else:
+            proposals = []
+            for item in self.policy.scope_summary(actor=context.actor, include_disabled=False):
+                permissions = item.get("permissions", {})
+                if permissions.get(str(Capability.READ), {}).get("allowed"):
+                    proposals.extend(self.workspace_engine.action_proposals(str(item["id"])))
+        self._audit_success(
+            context,
+            "workspace_action_proposals",
+            "action_proposals",
+            str(project_id or "visible_projects"),
+            scope_id=project_id,
+            metadata={"count": len(proposals)},
+        )
+        return {"status": "ok", "project_id": project_id, "proposals": proposals, "count": len(proposals)}
+
+    def _tool_workspace_propose_action(self, args: dict[str, Any], context: RequestContext) -> dict[str, Any]:
+        run_id = self._require_string(args, "run_id")
+        action = self._require_string(args, "action")
+        parameters = args.get("parameters", {})
+        if not isinstance(parameters, dict):
+            raise PolicyError("INVALID_INPUT", "parameters must be an object")
+        tool = _WORKSPACE_CONTROLLED_ACTION_TOOLS.get(action)
+        if tool is None:
+            raise PolicyError("INVALID_INPUT", "unsupported controlled workspace action")
+        try:
+            controlled = self.workspace_engine.controlled_action_context(
+                run_id, allow_completed=action == "push"
+            )
+        except ValueError as exc:
+            raise PolicyError("INVALID_WORKSPACE_RUN", str(exc)) from exc
+        scope_id = str(controlled["scope_id"])
+        scope = self.policy.get_scope(scope_id, actor=context.actor)
+        self.policy.require_capability(scope_id, Capability.READ, actor=context.actor)
+        scope, permission = self.policy.require_execution(scope_id, actor=context.actor)
+        if scope.kind != ScopeKind.PROJECT:
+            raise PolicyError("INVALID_SCOPE", "controlled workspace actions require a project scope")
+        self.policy.require_tool(tool, actor=context.actor)
+        if action == "push":
+            handoff_row = controlled.get("handoff")
+            report = handoff_row.get("report") if isinstance(handoff_row, dict) else None
+            verification = report.get("verification", {}) if isinstance(report, dict) else {}
+            if (
+                controlled.get("status") != "completed"
+                or not isinstance(report, dict)
+                or verification.get("verified") is not True
+                or report.get("publication_readiness") != "ready_for_review"
+            ):
+                raise PolicyError(
+                    "WORKSPACE_NOT_READY",
+                    "push proposals require a completed WorkRun with verified ready-for-review handoff",
+                )
+        operation, targets, payload, expected = self._workspace_controlled_action_plan(
+            run_id,
+            action,
+            parameters,
+            scope,
+            context,
+        )
+        result = self._authorize_mutation(
+            context,
+            tool=tool,
+            operation=operation,
+            scope_id=scope_id,
+            targets=targets,
+            payload=payload,
+            expected=expected,
+            permission=permission,
+            force_approval=True,
+            workspace_run_id=run_id,
+            workspace_action=action,
+        )
+        if result.get("status") != "approval_required":
+            raise PolicyError("APPROVAL_CREATE_FAILED", "controlled workspace action did not produce an approval")
+        if controlled.get("status") != "completed":
+            try:
+                self.workspace_engine.record(
+                    WorkEvent(
+                        run_id,
+                        "approval",
+                        {
+                            "status": "pending",
+                            "approval_id": result["approval_id"],
+                            "target": action,
+                        },
+                    )
+                )
+            except (ValueError, StorageError) as exc:
+                self.store.decide_approval(
+                    result["approval_id"],
+                    ApprovalStatus.DENIED,
+                    "workspace evidence recording failed",
+                    expected_status=ApprovalStatus.PENDING,
+                )
+                raise PolicyError(
+                    "WORKSPACE_EVIDENCE_FAILED",
+                    "approval was cancelled because workspace evidence could not be recorded",
+                ) from exc
+        result["run_id"] = run_id
+        result["workspace_action"] = action
+        return result
+
+    def _workspace_controlled_action_plan(
+        self,
+        run_id: str,
+        action: str,
+        parameters: dict[str, Any],
+        scope: Any,
+        context: RequestContext,
+    ) -> tuple[str, list[str], dict[str, Any], dict[str, str | None]]:
+        root = Path(scope.root)
+        root_precondition = {"project_root": sha256_json({"root": scope.root})}
+        if action == "owned_service_start":
+            self._require_exact_parameter_keys(parameters, {"profile", "timeout_seconds"}, {"profile"})
+            profile_name = self._require_string(parameters, "profile")
+            timeout = parameters.get("timeout_seconds")
+            if timeout is not None:
+                timeout = self._bounded_int(timeout, 1, 3600)
+            profile = self.runner._resolve_project_profile(
+                profile_name, root, target=None, test_path=None
+            )
+            return (
+                "process_start",
+                [profile.name],
+                {"scope_id": scope.id, "profile": profile.name, "timeout_seconds": timeout},
+                root_precondition,
+            )
+        if action == "owned_service_stop":
+            self._require_exact_parameter_keys(parameters, {"process_id"}, {"process_id"})
+            process_id = self._require_string(parameters, "process_id")
+            row = self.store.get_runtime_by_id(process_id)
+            if not row or row.get("kind") != "managed_project":
+                raise PolicyError("PROCESS_NOT_FOUND", "managed process was not found")
+            if row.get("scope_id") != scope.id:
+                raise PolicyError("PROCESS_SCOPE_MISMATCH", "managed process belongs to another project")
+            return (
+                "process_stop",
+                [process_id],
+                {"scope_id": scope.id, "process_id": process_id},
+                {"command_digest": row.get("command_digest")},
+            )
+        if action == "targeted_verification":
+            self._require_exact_parameter_keys(parameters, {"target", "test_path"}, {"target", "test_path"})
+            target = self._require_string(parameters, "target")
+            if target not in {"backend", "frontend", "auto"}:
+                raise PolicyError("INVALID_INPUT", "target must be backend, frontend, or auto")
+            try:
+                test_path = self.workspace_engine.validate_verification_target(
+                    run_id, self._require_string(parameters, "test_path")
+                )
+            except ValueError as exc:
+                raise PolicyError("INVALID_VERIFICATION_TARGET", str(exc)) from exc
+            self.runner._resolve_project_profile(
+                "run_targeted_test", root, target=target, test_path=test_path
+            )
+            return (
+                "execute",
+                [test_path],
+                {
+                    "scope_id": scope.id,
+                    "profile": "run_targeted_test",
+                    "target": target,
+                    "test_path": test_path,
+                },
+                root_precondition,
+            )
+        if action == "commit":
+            self._require_exact_parameter_keys(parameters, {"message", "paths"}, {"message", "paths"})
+            message = self.git.commit_message(self._require_string(parameters, "message"))
+            raw_paths = parameters.get("paths")
+            if not isinstance(raw_paths, list):
+                raise PolicyError("INVALID_INPUT", "paths must be an array")
+            try:
+                paths = self.workspace_engine.validate_controlled_commit_paths(run_id, raw_paths)
+            except (PolicyError, ValueError) as exc:
+                raise PolicyError("INVALID_COMMIT_SCOPE", str(exc)) from exc
+            paths = self.git.validate_paths(paths)
+            expected = self._git_path_preconditions(scope.id, paths, context)
+            return (
+                "git_commit",
+                paths,
+                {"scope_id": scope.id, "message": message, "paths": paths},
+                {**expected, **root_precondition},
+            )
+        if action == "push":
+            self._require_exact_parameter_keys(parameters, {"remote", "branch"}, set())
+            remote = self.git.validate_remote(str(parameters.get("remote", "origin")))
+            current = self.git.run("current_branch", root, ["branch", "--show-current"])
+            current_branch = self.git.current_branch(current)
+            if not current_branch:
+                raise PolicyError("GIT_BRANCH_REQUIRED", "push requires a current branch")
+            branch_value = parameters.get("branch")
+            branch = self.git.validate_branch(branch_value) if branch_value is not None else current_branch
+            if branch != current_branch:
+                raise PolicyError(
+                    "GIT_BRANCH_MISMATCH",
+                    "workspace push proposals can only target the currently checked-out branch",
+                )
+            head_result = self.git.run("current_head", root, ["rev-parse", "--verify", "HEAD"])
+            head = self.git.current_head(head_result)
+            if not head:
+                raise PolicyError("GIT_HEAD_REQUIRED", "push requires a resolvable HEAD commit")
+            return (
+                "git_push",
+                [f"{remote}/{branch}", head],
+                {"scope_id": scope.id, "remote": remote, "branch": branch},
+                {**root_precondition, "branch": current_branch, "head": head},
+            )
+        raise PolicyError("INVALID_INPUT", "unsupported controlled workspace action")
+
+    @staticmethod
+    def _require_exact_parameter_keys(
+        parameters: dict[str, Any],
+        allowed: set[str],
+        required: set[str],
+    ) -> None:
+        unknown = sorted(set(parameters) - allowed)
+        if unknown:
+            raise PolicyError("INVALID_INPUT", f"unsupported action parameter(s): {', '.join(unknown)}")
+        missing = sorted(required - set(parameters))
+        if missing:
+            raise PolicyError("INVALID_INPUT", f"missing action parameter(s): {', '.join(missing)}")
 
     def _tool_workspace_context(self, args: dict[str, Any], context: RequestContext) -> dict[str, Any]:
         scope = self._workspace_scope(args.get("scope_id"), context)
@@ -1795,11 +2302,11 @@ class Broker:
             tool_enabled = False
             tool_error = exc.code
         scope_id = arguments.get("scope_id") if isinstance(arguments.get("scope_id"), str) else None
-        if scope_id is None and tool in {
-            "git_create_branch", "git_stage_paths", "git_commit", "git_restore_file", "git_push",
-            "run_backend_test", "run_frontend_test", "run_targeted_test", "run_lint", "run_typecheck", "run_build",
-        }:
-            scope_id = self._project_scope_id()
+        if scope_id is None and tool in _PROJECT_SCOPE_TOOLS:
+            raise PolicyError(
+                "INVALID_INPUT",
+                "scope_id is required for project-bound tools; call list_scopes and select one project scope",
+            )
         permission_decision: dict[str, Any] = {"allowed": True}
         if scope_id:
             capability = {
@@ -1868,11 +2375,9 @@ class Broker:
         profile: str,
         args: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        scope_id = self._project_scope_id()
-        scope, permission = self.policy.require_execution(scope_id, actor=context.actor)
-        if scope.kind != ScopeKind.PROJECT:
-            raise PolicyError("INVALID_SCOPE", "execution tools require a project scope")
         args = args or {}
+        scope_id, scope = self._require_project_scope(args, context)
+        scope, permission = self.policy.require_execution(scope_id, actor=context.actor)
         target = args.get("target")
         test_path = args.get("test_path", args.get("test_file"))
         if target is not None and target not in {"backend", "frontend", "auto"}:
@@ -1907,6 +2412,7 @@ class Broker:
         data = {
             "control_center": "ready",
             "policy_version": self.store.policy_version(),
+            "bridge": self.bridge_status(),
             "mcp_bridge": mcp_state or "stopped",
             "tunnel": tunnel_state,
             "chatgpt_path": "ready_via_tunnel" if tunnel_state in {"healthy", "ready"} else "tunnel_client_running" if tunnel_state == "running" else "not_ready",
@@ -2033,6 +2539,11 @@ class Broker:
         if sha256_json(request.intent) != request.action_hash:
             self.store.consume_approval(approval_id)
             raise PolicyError("STALE_APPROVAL", "approval action hash is invalid")
+        try:
+            self._validate_workspace_approval_binding(request, context)
+        except PolicyError:
+            self.store.consume_approval(approval_id)
+            raise
         # Consume before executing so a crash or failed verifier cannot be retried silently.
         if not self.store.consume_approval(approval_id):
             raise PolicyError("APPROVAL_NOT_GRANTED", "approval was already claimed")
@@ -2056,6 +2567,9 @@ class Broker:
         payload: dict[str, Any],
         expected: dict[str, str | None],
         permission: dict[str, Any],
+        force_approval: bool = False,
+        workspace_run_id: str | None = None,
+        workspace_action: str | None = None,
     ) -> dict[str, Any]:
         intent = {
             "request_id": context.request_id,
@@ -2070,8 +2584,18 @@ class Broker:
             "expected_preconditions": expected,
             "policy_version": self.store.policy_version(),
         }
+        if workspace_run_id is not None or workspace_action is not None:
+            if (
+                not isinstance(workspace_run_id, str)
+                or not workspace_run_id
+                or workspace_action not in _WORKSPACE_CONTROLLED_ACTION_TOOLS
+                or _WORKSPACE_CONTROLLED_ACTION_TOOLS[workspace_action] != tool
+            ):
+                raise PolicyError("INVALID_WORKSPACE_ACTION", "controlled workspace approval metadata is invalid")
+            intent["workspace_run_id"] = workspace_run_id
+            intent["workspace_action"] = workspace_action
         action_hash = sha256_json(intent)
-        needs_approval = self.policy.approval_required(tool, permission, operation)
+        needs_approval = force_approval or self.policy.approval_required(tool, permission, operation)
         if needs_approval:
             approval_id = str(uuid.uuid4())
             expires_at = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(timespec="milliseconds")
@@ -2208,6 +2732,10 @@ class Broker:
                     current_branch = self.git.current_branch(current)
                     if current_branch != expected.get("branch"):
                         raise PolicyError("PRECONDITION_CHANGED", "current branch changed before push")
+                    head_result = self.git.run("current_head", project_root, ["rev-parse", "--verify", "HEAD"])
+                    current_head = self.git.current_head(head_result)
+                    if current_head != expected.get("head"):
+                        raise PolicyError("PRECONDITION_CHANGED", "HEAD changed before push")
                     remote = self.git.validate_remote(payload["remote"])
                     branch = self.git.validate_branch(payload["branch"])
                     git_result = self.git.run("push", project_root, ["push", remote, branch])
@@ -2504,6 +3032,16 @@ class Broker:
                         output_limit=tool_policy.output_limit_bytes,
                         timeout_seconds=max(1, tool_policy.max_duration_ms // 1000),
                     )
+                if tool == "run_targeted_test" and isinstance(intent.get("workspace_run_id"), str):
+                    try:
+                        self.workspace_engine.record_verification_result(
+                            intent["workspace_run_id"],
+                            result_data,
+                            target=str(payload.get("test_path") or "full"),
+                            expected_scope_id=project_scope_id,
+                        )
+                    except ValueError as exc:
+                        raise PolicyError("WORKSPACE_EVIDENCE_FAILED", str(exc)) from exc
                 result_data = self._redact_command_result(result_data)
                 metadata = {
                     "profile": payload["profile"],
@@ -2809,9 +3347,62 @@ class Broker:
             )
         return destination_directory_display, plan, item_limit
 
+    def _validate_workspace_approval_binding(
+        self,
+        request: ApprovalRequest,
+        context: RequestContext,
+    ) -> None:
+        intent = request.intent
+        run_id = intent.get("workspace_run_id")
+        if run_id is None:
+            return
+        action = intent.get("workspace_action")
+        tool = intent.get("tool")
+        if (
+            not isinstance(run_id, str)
+            or action not in _WORKSPACE_CONTROLLED_ACTION_TOOLS
+            or _WORKSPACE_CONTROLLED_ACTION_TOOLS[action] != tool
+        ):
+            raise PolicyError("STALE_APPROVAL", "workspace approval binding is invalid")
+        try:
+            controlled = self.workspace_engine.controlled_action_context(
+                run_id, allow_completed=action == "push"
+            )
+        except ValueError as exc:
+            raise PolicyError("STALE_APPROVAL", str(exc)) from exc
+        scope_id = str(controlled["scope_id"])
+        if intent.get("scope_id") != scope_id:
+            raise PolicyError("STALE_APPROVAL", "workspace approval scope changed")
+        self.policy.require_tool(str(tool), actor=context.actor)
+        scope, _ = self.policy.require_execution(scope_id, actor=context.actor)
+        if scope.kind != ScopeKind.PROJECT:
+            raise PolicyError("STALE_APPROVAL", "workspace approval no longer targets a project")
+        if action == "push":
+            handoff_row = controlled.get("handoff")
+            report = handoff_row.get("report") if isinstance(handoff_row, dict) else None
+            verification = report.get("verification", {}) if isinstance(report, dict) else {}
+            if (
+                controlled.get("status") != "completed"
+                or not isinstance(report, dict)
+                or verification.get("verified") is not True
+                or report.get("publication_readiness") != "ready_for_review"
+            ):
+                raise PolicyError("STALE_APPROVAL", "workspace push approval is no longer publication-ready")
+
     @staticmethod
     def _is_approval_request(request: ApprovalRequest) -> bool:
-        return request.intent.get("tool") in {"delete_file", "git_restore_file", "git_push"}
+        tool = request.intent.get("tool")
+        run_id = request.intent.get("workspace_run_id")
+        if run_id is None:
+            return tool in {"delete_file", "git_restore_file", "git_push"}
+        action = request.intent.get("workspace_action")
+        return (
+            isinstance(run_id, str)
+            and bool(run_id)
+            and action in _WORKSPACE_CONTROLLED_ACTION_TOOLS
+            and _WORKSPACE_CONTROLLED_ACTION_TOOLS[action] == tool
+            and tool in _WORKSPACE_APPROVAL_TOOLS
+        )
 
     @staticmethod
     def _is_delete_approval(request: ApprovalRequest) -> bool:
@@ -2830,6 +3421,19 @@ class Broker:
         if scope.kind == ScopeKind.FILE:
             raise PolicyError("INVALID_SCOPE", "workspace operations require a directory or project scope")
         return scope
+
+    def _workspace_project_scope(self, project_id: Any, context: RequestContext) -> tuple[Any, WorkspaceScope]:
+        if not isinstance(project_id, str) or not project_id:
+            raise PolicyError("INVALID_INPUT", "project_id is required")
+        scope = self.policy.get_scope(project_id, actor=context.actor)
+        if scope.kind != ScopeKind.PROJECT:
+            raise PolicyError("INVALID_SCOPE", "WorkspaceEngine requires a project scope")
+        self.policy.require_capability(scope.id, Capability.READ, actor=context.actor)
+        try:
+            workspace_scope = WorkspaceScope.from_scope(scope)
+        except ValueError as exc:
+            raise PolicyError("INVALID_SCOPE", str(exc)) from exc
+        return scope, workspace_scope
 
     def _visible_processes(self, context: RequestContext) -> list[dict[str, Any]]:
         visible: list[dict[str, Any]] = []
@@ -2910,7 +3514,7 @@ class Broker:
     @staticmethod
     def _safe_display(args: dict[str, Any]) -> str:
         values = []
-        for key in ("scope_id", "relative_path", "source_relative_path", "destination_relative_path", "query"):
+        for key in ("scope_id", "relative_path", "source_relative_path", "destination_relative_path", "query", "action"):
             value = args.get(key)
             if isinstance(value, str):
                 values.append(f"{key}={value[:160]}")
@@ -2956,7 +3560,18 @@ class Broker:
     def _public_intent(intent: dict[str, Any]) -> dict[str, Any]:
         return {
             key: intent[key]
-            for key in ("trace_id", "tool", "operation", "scope_id", "targets", "payload_digest", "expected_preconditions", "policy_version")
+            for key in (
+                "trace_id",
+                "tool",
+                "operation",
+                "scope_id",
+                "targets",
+                "payload_digest",
+                "expected_preconditions",
+                "policy_version",
+                "workspace_run_id",
+                "workspace_action",
+            )
             if key in intent
         }
 

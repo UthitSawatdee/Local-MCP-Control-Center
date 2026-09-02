@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import sqlite3
 from pathlib import Path
@@ -9,7 +10,7 @@ from typing import Any, Iterable
 
 from .errors import StorageError
 from .models import ApprovalMode, ApprovalRequest, Scope, ToolPolicy, utc_now
-from .registry import TOOL_DEFINITIONS
+from .registry import BROWSER_TOOL_NAMES, TOOL_DEFINITIONS
 
 
 CAPABILITIES = ("read", "execute", "write", "create", "rename", "move", "delete")
@@ -17,6 +18,19 @@ APPROVAL_MODES = {str(mode) for mode in ApprovalMode}
 DELETE_TOOL = "delete_file"
 DELETE_CAPABILITY = "delete"
 DANGEROUS_TOOLS = {DELETE_TOOL, "git_restore_file", "git_push"}
+MCP_BRIDGE_SNAPSHOT_KEY = "mcp_bridge_snapshot"
+BROWSER_DEFAULTS_MIGRATION_KEY = "browser_tools_default_enabled_v1"
+
+
+def _workspace_payload_hash(value: Any) -> str:
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _workspace_evidence_hash(run_id: str, sequence: int, event_type: str, payload: dict[str, Any]) -> str:
+    return _workspace_payload_hash(
+        {"run_id": run_id, "sequence": sequence, "event_type": event_type, "payload": payload}
+    )
 
 
 class Store:
@@ -221,6 +235,56 @@ class Store:
             error_code TEXT,
             updated_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS workspace_capsules (
+            scope_id TEXT PRIMARY KEY REFERENCES scopes(id) ON DELETE CASCADE,
+            capsule_json TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            source TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS workspace_snapshots (
+            snapshot_id TEXT PRIMARY KEY,
+            scope_id TEXT NOT NULL REFERENCES scopes(id) ON DELETE CASCADE,
+            snapshot_json TEXT NOT NULL,
+            environment_fingerprint TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_workspace_snapshots_scope_created
+            ON workspace_snapshots(scope_id, created_at DESC);
+        CREATE TABLE IF NOT EXISTS workspace_runs (
+            run_id TEXT PRIMARY KEY,
+            scope_id TEXT NOT NULL REFERENCES scopes(id) ON DELETE CASCADE,
+            goal TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            status TEXT NOT NULL,
+            work_package_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            started_at TEXT,
+            completed_at TEXT,
+            updated_at TEXT NOT NULL,
+            last_error TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_workspace_runs_scope_created
+            ON workspace_runs(scope_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_workspace_runs_status_updated
+            ON workspace_runs(status, updated_at DESC);
+        CREATE TABLE IF NOT EXISTS workspace_evidence (
+            evidence_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL REFERENCES workspace_runs(run_id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
+            sequence INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            payload_hash TEXT NOT NULL,
+            recorded_at TEXT NOT NULL,
+            UNIQUE(run_id, sequence)
+        );
+        CREATE INDEX IF NOT EXISTS idx_workspace_evidence_run_sequence
+            ON workspace_evidence(run_id, sequence);
+        CREATE TABLE IF NOT EXISTS workspace_handoffs (
+            run_id TEXT PRIMARY KEY REFERENCES workspace_runs(run_id) ON DELETE CASCADE,
+            report_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
         """
         with self._lock:
             self._conn.executescript(schema)
@@ -302,6 +366,23 @@ class Store:
         it is started from the CLI or MCP bridge instead of the GUI.
         """
         changed = 0
+        browser_defaults_migrated = self._conn.execute(
+            "SELECT value FROM meta WHERE key=?",
+            (BROWSER_DEFAULTS_MIGRATION_KEY,),
+        ).fetchone()
+        if not browser_defaults_migrated:
+            placeholders = ",".join("?" for _ in BROWSER_TOOL_NAMES)
+            cursor = self._conn.execute(
+                f"UPDATE tool_policies SET enabled=1, updated_at=? "
+                f"WHERE tool_name IN ({placeholders}) AND enabled=0",
+                (now, *sorted(BROWSER_TOOL_NAMES)),
+            )
+            changed += max(cursor.rowcount, 0)
+            self._conn.execute(
+                "INSERT INTO meta(key, value) VALUES(?, ?)",
+                (BROWSER_DEFAULTS_MIGRATION_KEY, "1"),
+            )
+
         placeholders = ",".join("?" for _ in DANGEROUS_TOOLS)
         cursor = self._conn.execute(
             f"""
@@ -374,6 +455,55 @@ class Store:
     def policy_version(self) -> int:
         row = self._fetchone("SELECT value FROM meta WHERE key='policy_version'")
         return int(row["value"]) if row else 1
+
+    def get_mcp_bridge_snapshot(self) -> dict[str, Any] | None:
+        row = self._fetchone("SELECT value FROM meta WHERE key=?", (MCP_BRIDGE_SNAPSHOT_KEY,))
+        if not row:
+            return None
+        try:
+            value = json.loads(row["value"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise StorageError("MCP bridge snapshot is corrupted") from exc
+        if not isinstance(value, dict):
+            raise StorageError("MCP bridge snapshot must be an object")
+        return value
+
+    def set_mcp_bridge_snapshot(self, snapshot: dict[str, Any]) -> None:
+        required = {"pid", "tool_count", "policy_version", "started_at"}
+        if set(snapshot) != required:
+            raise StorageError("MCP bridge snapshot has unsupported or missing fields")
+        for field in ("pid", "tool_count", "policy_version"):
+            value = snapshot[field]
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise StorageError(f"MCP bridge snapshot field {field} must be a non-negative integer")
+        if not isinstance(snapshot["started_at"], str) or not snapshot["started_at"]:
+            raise StorageError("MCP bridge snapshot started_at must be text")
+        encoded = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO meta(key, value) VALUES(?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (MCP_BRIDGE_SNAPSHOT_KEY, encoded),
+            )
+            self._conn.commit()
+
+    def clear_mcp_bridge_snapshot(self, *, pid: int | None = None) -> None:
+        with self._lock:
+            if pid is not None:
+                row = self._conn.execute(
+                    "SELECT value FROM meta WHERE key=?",
+                    (MCP_BRIDGE_SNAPSHOT_KEY,),
+                ).fetchone()
+                if not row:
+                    return
+                try:
+                    snapshot = json.loads(row["value"])
+                except (TypeError, json.JSONDecodeError):
+                    return
+                if not isinstance(snapshot, dict) or snapshot.get("pid") != pid:
+                    return
+            self._conn.execute("DELETE FROM meta WHERE key=?", (MCP_BRIDGE_SNAPSHOT_KEY,))
+            self._conn.commit()
 
     def get_tunnel_config(self) -> dict[str, Any] | None:
         """Return non-secret tunnel settings; the API key never lives in SQLite."""
@@ -515,6 +645,21 @@ class Store:
     def delete_scope(self, scope_id: str) -> None:
         with self._lock:
             try:
+                # Explicit cleanup keeps scope removal compatible with
+                # databases created before these tables used cascading FKs.
+                self._conn.execute(
+                    "DELETE FROM workspace_handoffs WHERE run_id IN "
+                    "(SELECT run_id FROM workspace_runs WHERE scope_id=?)",
+                    (scope_id,),
+                )
+                self._conn.execute(
+                    "DELETE FROM workspace_evidence WHERE run_id IN "
+                    "(SELECT run_id FROM workspace_runs WHERE scope_id=?)",
+                    (scope_id,),
+                )
+                self._conn.execute("DELETE FROM workspace_runs WHERE scope_id=?", (scope_id,))
+                self._conn.execute("DELETE FROM workspace_snapshots WHERE scope_id=?", (scope_id,))
+                self._conn.execute("DELETE FROM workspace_capsules WHERE scope_id=?", (scope_id,))
                 self._conn.execute("DELETE FROM scopes WHERE id=?", (scope_id,))
                 self._conn.commit()
             except sqlite3.IntegrityError as exc:
@@ -745,6 +890,273 @@ class Store:
 
     def list_runtime(self) -> list[dict[str, Any]]:
         return [dict(row) for row in self._fetchall("SELECT * FROM runtime_processes ORDER BY kind")]
+
+    # ---- DevOS workspace engine -------------------------------------------
+
+    def upsert_workspace_capsule(
+        self,
+        scope_id: str,
+        capsule: dict[str, Any],
+        *,
+        content_hash: str,
+        source: str = "control-plane",
+    ) -> None:
+        encoded = json.dumps(capsule, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        if len(encoded.encode("utf-8")) > 262_144:
+            raise StorageError("workspace capsule exceeds 256 KiB")
+        if not isinstance(content_hash, str) or not content_hash:
+            raise StorageError("workspace capsule content hash is required")
+        if not isinstance(source, str) or not source or len(source) > 120:
+            raise StorageError("workspace capsule source is invalid")
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO workspace_capsules(scope_id, capsule_json, content_hash, source, updated_at) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(scope_id) DO UPDATE SET capsule_json=excluded.capsule_json, "
+                "content_hash=excluded.content_hash, source=excluded.source, updated_at=excluded.updated_at",
+                (scope_id, encoded, content_hash, source, utc_now()),
+            )
+            self._conn.commit()
+
+    def get_workspace_capsule(self, scope_id: str) -> dict[str, Any] | None:
+        row = self._fetchone(
+            "SELECT capsule_json, content_hash, source, updated_at FROM workspace_capsules WHERE scope_id=?",
+            (scope_id,),
+        )
+        if not row:
+            return None
+        try:
+            capsule = json.loads(row["capsule_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise StorageError("workspace capsule is corrupted") from exc
+        if not isinstance(capsule, dict):
+            raise StorageError("workspace capsule must be an object")
+        return {
+            "capsule": capsule,
+            "content_hash": row["content_hash"],
+            "source": row["source"],
+            "updated_at": row["updated_at"],
+        }
+
+    def save_workspace_snapshot(
+        self,
+        snapshot_id: str,
+        scope_id: str,
+        snapshot: dict[str, Any],
+        *,
+        environment_fingerprint: str,
+        created_at: str | None = None,
+    ) -> None:
+        encoded = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        if len(encoded.encode("utf-8")) > 2_000_000:
+            raise StorageError("workspace snapshot exceeds 2 MiB")
+        if not snapshot_id or not scope_id or not environment_fingerprint:
+            raise StorageError("workspace snapshot identity is incomplete")
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO workspace_snapshots"
+                "(snapshot_id, scope_id, snapshot_json, environment_fingerprint, created_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (snapshot_id, scope_id, encoded, environment_fingerprint, created_at or utc_now()),
+            )
+            self._conn.commit()
+
+    def get_workspace_snapshot(self, snapshot_id: str) -> dict[str, Any] | None:
+        row = self._fetchone("SELECT * FROM workspace_snapshots WHERE snapshot_id=?", (snapshot_id,))
+        return self._decode_workspace_snapshot(row) if row else None
+
+    def latest_workspace_snapshot(self, scope_id: str) -> dict[str, Any] | None:
+        row = self._fetchone(
+            "SELECT * FROM workspace_snapshots WHERE scope_id=? ORDER BY created_at DESC LIMIT 1",
+            (scope_id,),
+        )
+        return self._decode_workspace_snapshot(row) if row else None
+
+    @staticmethod
+    def _decode_workspace_snapshot(row: sqlite3.Row) -> dict[str, Any]:
+        try:
+            snapshot = json.loads(row["snapshot_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise StorageError("workspace snapshot is corrupted") from exc
+        if not isinstance(snapshot, dict):
+            raise StorageError("workspace snapshot must be an object")
+        return {
+            "snapshot_id": row["snapshot_id"],
+            "scope_id": row["scope_id"],
+            "snapshot": snapshot,
+            "environment_fingerprint": row["environment_fingerprint"],
+            "created_at": row["created_at"],
+        }
+
+    def create_workspace_run(self, data: dict[str, Any]) -> None:
+        fields = {
+            "run_id", "scope_id", "goal", "mode", "status", "work_package_json",
+            "created_at", "started_at", "completed_at", "updated_at", "last_error",
+        }
+        required = fields - {"started_at", "completed_at", "last_error"}
+        if set(data) - fields or not required.issubset(data):
+            raise StorageError("unsupported or incomplete workspace run fields")
+        with self._lock:
+            try:
+                self._conn.execute(
+                    "INSERT INTO workspace_runs"
+                    "(run_id, scope_id, goal, mode, status, work_package_json, created_at, started_at, completed_at, updated_at, last_error)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    tuple(data.get(key) for key in (
+                        "run_id", "scope_id", "goal", "mode", "status", "work_package_json",
+                        "created_at", "started_at", "completed_at", "updated_at", "last_error",
+                    )),
+                )
+                self._conn.commit()
+            except sqlite3.IntegrityError as exc:
+                self._conn.rollback()
+                raise StorageError(str(exc)) from exc
+
+    def get_workspace_run(self, run_id: str) -> dict[str, Any] | None:
+        row = self._fetchone("SELECT * FROM workspace_runs WHERE run_id=?", (run_id,))
+        return dict(row) if row else None
+
+    def list_workspace_runs(
+        self,
+        *,
+        scope_id: str | None = None,
+        statuses: tuple[str, ...] | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if scope_id is not None:
+            clauses.append("scope_id=?")
+            params.append(scope_id)
+        if statuses:
+            placeholders = ",".join("?" for _ in statuses)
+            clauses.append(f"status IN ({placeholders})")
+            params.extend(statuses)
+        query = "SELECT * FROM workspace_runs"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 100)))
+        return [dict(row) for row in self._fetchall(query, params)]
+
+    def update_workspace_run(self, run_id: str, **changes: Any) -> None:
+        allowed = {"status", "work_package_json", "started_at", "completed_at", "updated_at", "last_error"}
+        unknown = set(changes) - allowed
+        if unknown:
+            raise StorageError(f"unsupported workspace run fields: {sorted(unknown)}")
+        if not changes:
+            return
+        changes.setdefault("updated_at", utc_now())
+        fields = ", ".join(f"{key}=?" for key in changes)
+        with self._lock:
+            self._conn.execute(
+                f"UPDATE workspace_runs SET {fields} WHERE run_id=?",
+                (*changes.values(), run_id),
+            )
+            self._conn.commit()
+
+    def append_workspace_evidence(self, data: dict[str, Any]) -> dict[str, Any]:
+        fields = {"evidence_id", "run_id", "event_type", "payload_json", "payload_hash", "recorded_at"}
+        if set(data) != fields:
+            raise StorageError("unsupported or incomplete workspace evidence fields")
+        if len(str(data["payload_json"]).encode("utf-8")) > 256_000:
+            raise StorageError("workspace evidence payload exceeds 256 KiB")
+        with self._lock:
+            run = self._conn.execute(
+                "SELECT status FROM workspace_runs WHERE run_id=?",
+                (data["run_id"],),
+            ).fetchone()
+            if run is None:
+                raise StorageError("workspace run was not found")
+            if run["status"] == "completed":
+                raise StorageError("completed workspace runs are immutable")
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence FROM workspace_evidence WHERE run_id=?",
+                (data["run_id"],),
+            ).fetchone()
+            sequence = int(row["next_sequence"])
+            try:
+                payload = json.loads(data["payload_json"])
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise StorageError("workspace evidence payload must be valid JSON") from exc
+            if not isinstance(payload, dict):
+                raise StorageError("workspace evidence payload must be an object")
+            payload_hash = _workspace_evidence_hash(
+                str(data["run_id"]), sequence, str(data["event_type"]), payload
+            )
+            self._conn.execute(
+                "INSERT INTO workspace_evidence"
+                "(evidence_id, run_id, sequence, event_type, payload_json, payload_hash, recorded_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    data["evidence_id"], data["run_id"], sequence, data["event_type"],
+                    data["payload_json"], payload_hash, data["recorded_at"],
+                ),
+            )
+            self._conn.commit()
+        return {**data, "sequence": sequence, "payload_hash": payload_hash}
+
+    def workspace_evidence(self, run_id: str) -> list[dict[str, Any]]:
+        rows = self._fetchall(
+            "SELECT * FROM workspace_evidence WHERE run_id=? ORDER BY sequence",
+            (run_id,),
+        )
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"])
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise StorageError("workspace evidence is corrupted") from exc
+            if not isinstance(payload, dict):
+                raise StorageError("workspace evidence payload must be an object")
+            expected_hash = _workspace_evidence_hash(
+                str(row["run_id"]), int(row["sequence"]), str(row["event_type"]), payload
+            )
+            if row["payload_hash"] != expected_hash:
+                raise StorageError("workspace evidence hash mismatch")
+            result.append({
+                "evidence_id": row["evidence_id"],
+                "run_id": row["run_id"],
+                "sequence": int(row["sequence"]),
+                "event_type": row["event_type"],
+                "payload": payload,
+                "payload_hash": row["payload_hash"],
+                "recorded_at": row["recorded_at"],
+            })
+        return result
+
+    def save_workspace_handoff(
+        self,
+        run_id: str,
+        report: dict[str, Any],
+        *,
+        created_at: str | None = None,
+    ) -> None:
+        encoded = json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        if len(encoded.encode("utf-8")) > 1_000_000:
+            raise StorageError("workspace handoff exceeds 1 MiB")
+        with self._lock:
+            try:
+                self._conn.execute(
+                    "INSERT INTO workspace_handoffs(run_id, report_json, created_at) VALUES (?, ?, ?)",
+                    (run_id, encoded, created_at or utc_now()),
+                )
+                self._conn.commit()
+            except sqlite3.IntegrityError as exc:
+                self._conn.rollback()
+                raise StorageError(str(exc)) from exc
+
+    def get_workspace_handoff(self, run_id: str) -> dict[str, Any] | None:
+        row = self._fetchone("SELECT * FROM workspace_handoffs WHERE run_id=?", (run_id,))
+        if not row:
+            return None
+        try:
+            report = json.loads(row["report_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise StorageError("workspace handoff is corrupted") from exc
+        if not isinstance(report, dict):
+            raise StorageError("workspace handoff must be an object")
+        return {"run_id": row["run_id"], "report": report, "created_at": row["created_at"]}
 
     # ---- provider-backed agent runtime ------------------------------------
 

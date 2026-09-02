@@ -45,6 +45,25 @@ def _parser() -> argparse.ArgumentParser:
     commands.add_parser("list-tools", help="print tool policies as JSON")
     commands.add_parser("verify-audit", help="verify the local audit hash chain")
     commands.add_parser("status", help="print local control-center status")
+    doctor = commands.add_parser("doctor", help="observe one registered project workspace")
+    doctor.add_argument("project_id", help="registered project scope ID")
+    observe = commands.add_parser("observe", help="observe one registered project workspace")
+    observe.add_argument("project_id", help="registered project scope ID")
+    prepare = commands.add_parser("prepare", help="prepare a bounded workspace work package")
+    prepare.add_argument("project_id", help="registered project scope ID")
+    prepare.add_argument("goal", help="bounded work goal")
+    prepare.add_argument("--mode", choices=["diagnose", "implement", "review"], default="implement")
+    prepare.add_argument("--scope", dest="allowed_scope", action="append", help="allowed relative path; repeatable")
+    run_status = commands.add_parser("run-status", help="show a workspace run and evidence")
+    run_status.add_argument("run_id", help="WorkspaceEngine run ID")
+    finish = commands.add_parser("finish", help="finish a workspace run and generate handoff")
+    finish.add_argument("run_id", help="WorkspaceEngine run ID")
+    proposals = commands.add_parser("action-proposals", help="list pending dangerous action proposals")
+    proposals.add_argument("project_id", nargs="?", help="optional registered project scope ID")
+    propose = commands.add_parser("propose-action", help="create one approval-gated WorkspaceEngine controlled-action proposal")
+    propose.add_argument("run_id", help="WorkspaceEngine run ID")
+    propose.add_argument("action", choices=["owned_service_start", "owned_service_stop", "targeted_verification", "commit", "push"])
+    propose.add_argument("--parameters-json", default="{}", help="JSON object containing bounded action parameters")
     pending = commands.add_parser("pending-approvals", help="print pending approvals as JSON")
     pending.set_defaults(command="pending-approvals")
 
@@ -73,7 +92,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     store, broker = _open(args.data_dir)
     if args.command == "gui":
         # Import lazily so the MCP bridge remains usable on headless systems.
-        from .gui import launch_gui
+        from .gui_ux import launch_gui
 
         try:
             launch_gui(broker, RuntimeSupervisor(store, broker.audit))
@@ -103,6 +122,42 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "status":
             _emit(broker.invoke("runtime_status", actor="user"))
             return 0
+        if args.command in {"doctor", "observe"}:
+            result = broker.invoke("workspace_observe", {"project_id": args.project_id}, actor="user")
+            _emit(result)
+            return 0 if result.get("status") == "ok" else 2
+        if args.command == "prepare":
+            payload = {"project_id": args.project_id, "goal": args.goal, "mode": args.mode}
+            if args.allowed_scope:
+                payload["allowed_scope"] = args.allowed_scope
+            result = broker.invoke("workspace_prepare", payload, actor="user")
+            _emit(result)
+            return 0 if result.get("status") == "ok" else 2
+        if args.command == "run-status":
+            result = broker.invoke("workspace_run_status", {"run_id": args.run_id}, actor="user")
+            _emit(result)
+            return 0 if result.get("status") == "ok" else 2
+        if args.command == "finish":
+            result = broker.invoke("workspace_finish", {"run_id": args.run_id}, actor="user")
+            _emit(result)
+            return 0 if result.get("status") == "ok" else 2
+        if args.command == "action-proposals":
+            payload = {} if args.project_id is None else {"project_id": args.project_id}
+            result = broker.invoke("workspace_action_proposals", payload, actor="user")
+            _emit(result)
+            return 0 if result.get("status") == "ok" else 2
+        if args.command == "propose-action":
+            try:
+                parameters = json.loads(args.parameters_json)
+            except json.JSONDecodeError:
+                _emit({"status": "denied", "error_code": "INVALID_INPUT", "message": "parameters-json must be a JSON object"})
+                return 2
+            if not isinstance(parameters, dict):
+                _emit({"status": "denied", "error_code": "INVALID_INPUT", "message": "parameters-json must be a JSON object"})
+                return 2
+            result = broker.invoke("workspace_propose_action", {"run_id": args.run_id, "action": args.action, "parameters": parameters}, actor="user")
+            _emit(result)
+            return 0 if result.get("status") == "approval_required" else 2
         if args.command == "pending-approvals":
             _emit({"status": "ok", "approvals": broker.pending_approvals()})
             return 0

@@ -11,6 +11,7 @@ import json
 import os
 import re
 import secrets
+import socket
 import threading
 import time
 from dataclasses import dataclass, field
@@ -46,16 +47,30 @@ _SENSITIVE_URL_PARTS = {
     "token",
 }
 _DESTRUCTIVE_WORDS = re.compile(r"(?i)\b(delete|remove|destroy|archive|discard|void)\b")
+LEGACY_BROWSER_PROFILE_NAME = "motion-erp"
+
+
+def _local_browser_profile_name() -> str:
+    """Use this machine's local hostname as the browser profile identifier."""
+    hostname = socket.gethostname().split(".", 1)[0].strip()
+    normalized = re.sub(r"[^A-Za-z0-9_.-]+", "-", hostname)
+    return normalized if normalized not in {"", ".", ".."} else "local-browser"
+
+
+LOCAL_BROWSER_PROFILE_NAME = _local_browser_profile_name()
 
 
 @dataclass(frozen=True, slots=True)
 class BrowserProfilePolicy:
     name: str
     allowed_origins: tuple[str, ...]
+    allow_internet: bool = False
 
     def __post_init__(self) -> None:
         if not self.name or not self.allowed_origins:
             raise ValueError("browser profile needs a name and allowed origin")
+        if not isinstance(self.allow_internet, bool):
+            raise ValueError("browser profile internet access must be a boolean")
         normalized = tuple(_normalize_origin(origin) for origin in self.allowed_origins)
         if any(origin is None for origin in normalized):
             raise ValueError("browser profile origins must be absolute http(s) origins")
@@ -105,9 +120,10 @@ def _origin_for_url(value: str) -> str | None:
 
 
 BROWSER_PROFILES: Mapping[str, BrowserProfilePolicy] = {
-    "motion-erp": BrowserProfilePolicy(
-        name="motion-erp",
+    LOCAL_BROWSER_PROFILE_NAME: BrowserProfilePolicy(
+        name=LOCAL_BROWSER_PROFILE_NAME,
         allowed_origins=("https://dynamics-motion.asia.motionerpcloud.com",),
+        allow_internet=True,
     ),
 }
 
@@ -167,6 +183,17 @@ class BrowserManager:
         self._lock = threading.RLock()
         self._sessions: dict[str, BrowserSession] = {}
         self._playwright: Any = None
+        self._migrate_legacy_profile()
+
+    def _migrate_legacy_profile(self) -> None:
+        """Keep the existing persistent browser data when the profile is renamed."""
+        if LOCAL_BROWSER_PROFILE_NAME == LEGACY_BROWSER_PROFILE_NAME:
+            return
+        legacy_dir = self.data_dir / LEGACY_BROWSER_PROFILE_NAME
+        renamed_dir = self.data_dir / LOCAL_BROWSER_PROFILE_NAME
+        if renamed_dir.exists() or not legacy_dir.is_dir() or legacy_dir.is_symlink():
+            return
+        legacy_dir.replace(renamed_dir)
 
     def open(self, profile_name: str) -> dict[str, Any]:
         with self._lock:
@@ -436,6 +463,7 @@ class BrowserManager:
                     {
                         "profile": profile.name,
                         "allowed_origins": list(profile.allowed_origins),
+                        "internet_access": profile.allow_internet,
                         "active_session_count": sum(item.profile.name == profile.name for item in self._sessions.values()),
                     }
                     for profile in self.profiles.values()
@@ -492,9 +520,9 @@ class BrowserManager:
         if self._url_allowed(session.profile, url, allow_blank=True) or url.startswith(("data:", "blob:")):
             route.continue_()
             return
-        # Static third-party assets are denied without poisoning the page. A
-        # document/frame navigation outside the profile is a boundary escape
-        # and is surfaced to the caller as DOMAIN_NOT_ALLOWED.
+        # Static requests outside the profile network policy are denied without
+        # poisoning the page. A document/frame navigation outside the policy is
+        # a boundary escape and is surfaced to the caller as DOMAIN_NOT_ALLOWED.
         if route.request.is_navigation_request():
             session.domain_violation = True
         route.abort()
@@ -549,7 +577,7 @@ class BrowserManager:
             session.domain_violation = False
             self._invalidate_refs(session)
             self._drop_session(session.session_id)
-            raise PolicyError("DOMAIN_NOT_ALLOWED", "browser navigation or popup left the profile allowlist")
+            raise PolicyError("DOMAIN_NOT_ALLOWED", "browser navigation or popup left the profile network policy")
         for page in list(session.context.pages):
             if self._url_allowed(session.profile, page.url, allow_blank=True):
                 continue
@@ -559,14 +587,14 @@ class BrowserManager:
                 pass
             if page is session.page:
                 self._drop_session(session.session_id)
-            raise PolicyError("DOMAIN_NOT_ALLOWED", "browser navigation or popup left the profile allowlist")
+            raise PolicyError("DOMAIN_NOT_ALLOWED", "browser navigation or popup left the profile network policy")
         self._trim_pages(session)
 
     def _navigate(self, session: BrowserSession, page: Any, url: str | None, timeout: int) -> None:
         if not isinstance(url, str) or not url:
             raise PolicyError("INVALID_INPUT", "navigate requires url")
         if not self._url_allowed(session.profile, url):
-            raise PolicyError("DOMAIN_NOT_ALLOWED", "navigation target is outside browser profile allowlist")
+            raise PolicyError("DOMAIN_NOT_ALLOWED", "navigation target is outside browser profile network policy")
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=timeout)
         except Exception as exc:
@@ -574,9 +602,9 @@ class BrowserManager:
                 session.domain_violation = False
                 self._invalidate_refs(session)
                 self._drop_session(session.session_id)
-                raise PolicyError("DOMAIN_NOT_ALLOWED", "redirect left browser profile allowlist") from exc
+                raise PolicyError("DOMAIN_NOT_ALLOWED", "redirect left browser profile network policy") from exc
             if not self._url_allowed(session.profile, page.url, allow_blank=True):
-                raise PolicyError("DOMAIN_NOT_ALLOWED", "redirect left browser profile allowlist") from exc
+                raise PolicyError("DOMAIN_NOT_ALLOWED", "redirect left browser profile network policy") from exc
             raise
         self._assert_pages_allowed(session)
 
@@ -699,7 +727,9 @@ class BrowserManager:
         if allow_blank and url in {"", "about:blank"}:
             return True
         origin = _origin_for_url(url)
-        return origin in profile.allowed_origins
+        if origin is None:
+            return False
+        return profile.allow_internet or origin in profile.allowed_origins
 
     def _touch(self, session: BrowserSession) -> None:
         session.last_activity = self._clock()
@@ -733,7 +763,7 @@ class BrowserManager:
                 return False
             if page.locator('input[type="password"]').count() > 0:
                 return False
-            if session.profile.name == "motion-erp" and page.locator(".o_web_client").count() > 0:
+            if session.profile.name == LOCAL_BROWSER_PROFILE_NAME and page.locator(".o_web_client").count() > 0:
                 return True
         except Exception:
             return None

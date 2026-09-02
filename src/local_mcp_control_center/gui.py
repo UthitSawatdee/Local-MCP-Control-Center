@@ -9,8 +9,30 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 from typing import Any
 
 from .broker import Broker
+from .browser import LOCAL_BROWSER_PROFILE_NAME
 from .models import ApprovalMode, Capability, ScopeKind
 from .supervisor import RuntimeSupervisor
+
+
+BRIDGE_POLL_INTERVAL_MS = 1_000
+
+
+def format_bridge_state(data: dict[str, Any]) -> str:
+    """Return a short bridge state suitable for status labels."""
+    return "Bridge stale" if data.get("stale") else f"Bridge {data.get('state', 'stopped')}"
+
+
+def format_bridge_metrics(data: dict[str, Any]) -> str:
+    """Build the separate catalog, policy, and live-bridge counts."""
+    lines = [
+        f"Registry total: {data.get('registry_total', 0)}",
+        f"Enabled: {data.get('enabled_count', 0)}",
+        f"Running bridge tools: {data.get('running_tool_count', 0)}",
+        format_bridge_state(data),
+    ]
+    if data.get("stale"):
+        lines.append("Action: Restart bridge to apply the latest policy.")
+    return "\n".join(lines)
 
 
 def format_runtime_status(data: dict[str, Any]) -> str:
@@ -43,6 +65,43 @@ def format_runtime_status(data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def format_workspace_health(data: dict[str, Any]) -> str:
+    """Build a compact, read-only project health summary for the Portal."""
+    project = data.get("project", {})
+    git = data.get("git", {})
+    runtime = data.get("runtime", {})
+    services = data.get("services", {})
+    environment = data.get("environment", {})
+    branch = git.get("branch") or "-"
+    git_parts = [str(git.get("state", "unavailable")), str(branch)]
+    if git.get("ahead"):
+        git_parts.append(f"ahead {git['ahead']}")
+    if git.get("behind"):
+        git_parts.append(f"behind {git['behind']}")
+    runtime_total = len(runtime)
+    runtime_available = sum(
+        1 for value in runtime.values()
+        if isinstance(value, dict) and value.get("state") == "available"
+    )
+    service_total = len(services)
+    service_listening = sum(
+        1 for value in services.values()
+        if isinstance(value, dict) and value.get("state") == "listening"
+    )
+    tracked_warnings = environment.get("tracked_environment_warnings", [])
+    lines = [
+        f"Project: {project.get('name', '-')} ({project.get('id', '-')})",
+        f"Git: {' · '.join(git_parts)}",
+        f"Runtime: {runtime_available}/{runtime_total} available",
+        f"Services: {service_listening}/{service_total} listening",
+        f"Capsule drift: {len(data.get('capsule_drift', []))}",
+        f"Tracked environment warnings: {len(tracked_warnings) if isinstance(tracked_warnings, list) else 0}",
+        f"Unfinished runs: {len(data.get('unfinished_runs', [])) if isinstance(data.get('unfinished_runs', []), list) else 0}",
+        f"Storage: {data.get('filesystem', {}).get('file_count', 0)} files, {data.get('filesystem', {}).get('bytes', 0)} bytes",
+    ]
+    return "\n".join(lines)
+
+
 class ControlCenterApp:
     """Native Tkinter MVP for policy, approval, audit, and runtime controls."""
 
@@ -57,8 +116,11 @@ class ControlCenterApp:
         self._scope_id: str | None = None
         self._scope_vars: dict[str, tk.BooleanVar] = {}
         self.scope_enabled = tk.BooleanVar(value=True)
+        self._bridge_status_cache: dict[str, Any] = {}
+        self._bridge_poll_job: str | None = None
         self._build()
         self.refresh_all()
+        self._bridge_poll_job = self.root.after(BRIDGE_POLL_INTERVAL_MS, self._poll_bridge_status)
 
     def run(self) -> None:
         self.root.mainloop()
@@ -88,6 +150,12 @@ class ControlCenterApp:
         ttk.Label(frame, text="Least privilege, dangerous-action approvals, and append-only audit metadata.").pack(anchor="w", pady=(4, 18))
         self.overview_text = tk.StringVar()
         ttk.Label(frame, textvariable=self.overview_text, justify="left", font=("Menlo", 12)).pack(anchor="w", pady=8)
+        self.bridge_metrics = tk.StringVar()
+        ttk.Label(frame, textvariable=self.bridge_metrics, justify="left", font=("Menlo", 12)).pack(anchor="w", pady=8)
+        self.workspace_health_text = tk.StringVar(value="No registered project scope")
+        health = ttk.LabelFrame(frame, text="Workspace health", padding=10)
+        health.pack(fill="x", pady=(8, 0))
+        ttk.Label(health, textvariable=self.workspace_health_text, justify="left", font=("Menlo", 10)).pack(anchor="w")
         actions = ttk.Frame(frame)
         actions.pack(anchor="w", pady=18)
         ttk.Button(actions, text="Start MCP bridge", command=self._start_mcp).pack(side="left", padx=(0, 8))
@@ -146,6 +214,8 @@ class ControlCenterApp:
         frame = ttk.Frame(notebook, padding=12)
         notebook.add(frame, text="Tools")
         ttk.Label(frame, text="Disabled tools are not registered in the MCP bridge until it is restarted.").pack(anchor="w", pady=(0, 8))
+        self.tool_summary = tk.StringVar()
+        ttk.Label(frame, textvariable=self.tool_summary, font=("Menlo", 10)).pack(anchor="w", pady=(0, 8))
         columns = ("name", "group", "risk", "enabled", "approval", "description")
         self.tool_tree = ttk.Treeview(frame, columns=columns, show="headings", height=20)
         headings = {"name": "Tool", "group": "Group", "risk": "Risk", "enabled": "Enabled", "approval": "Approval", "description": "Description"}
@@ -202,11 +272,14 @@ class ControlCenterApp:
         notebook.add(frame, text="Runtime")
         self.runtime_text = tk.StringVar()
         ttk.Label(frame, textvariable=self.runtime_text, justify="left", font=("Menlo", 12)).pack(anchor="w")
+        self.runtime_bridge_metrics = tk.StringVar()
+        ttk.Label(frame, textvariable=self.runtime_bridge_metrics, justify="left", font=("Menlo", 12)).pack(anchor="w", pady=(8, 0))
         actions = ttk.Frame(frame)
         actions.pack(anchor="w", pady=18)
         ttk.Button(actions, text="Configure tunnel", command=self._configure_tunnel).pack(side="left", padx=(0, 8))
         ttk.Button(actions, text="Start MCP", command=self._start_mcp).pack(side="left", padx=(0, 8))
         ttk.Button(actions, text="Stop MCP", command=self._stop_mcp).pack(side="left", padx=(0, 8))
+        ttk.Button(actions, text="Restart bridge", command=self._restart_bridge).pack(side="left", padx=(0, 8))
         ttk.Button(actions, text="Start tunnel", command=self._start_tunnel).pack(side="left", padx=(0, 8))
         ttk.Button(actions, text="Stop tunnel", command=self._stop_tunnel).pack(side="left", padx=(0, 8))
         ttk.Button(actions, text="Clear saved key", command=self._clear_tunnel_key).pack(side="left", padx=(0, 8))
@@ -220,12 +293,12 @@ class ControlCenterApp:
         ttk.Label(frame, text="Browser Profiles", font=("Helvetica", 20, "bold")).pack(anchor="w")
         ttk.Label(
             frame,
-            text="Browser automation stays behind Broker policy, exact origin allowlists, and the append-only audit chain.",
+            text="Browser automation stays behind Broker policy, the profile network policy, and the append-only audit chain.",
             wraplength=920,
         ).pack(anchor="w", pady=(4, 14))
-        profile = ttk.LabelFrame(frame, text="Motion ERP", padding=12)
+        profile = ttk.LabelFrame(frame, text=f"Local Browser ({LOCAL_BROWSER_PROFILE_NAME})", padding=12)
         profile.pack(fill="x")
-        ttk.Label(profile, text="Domain: dynamics-motion.asia.motionerpcloud.com").pack(anchor="w")
+        ttk.Label(profile, text="Target: Motion ERP · Network: HTTP/HTTPS internet enabled").pack(anchor="w")
         self.browser_state = tk.StringVar(value="Status: stopped")
         ttk.Label(profile, textvariable=self.browser_state, justify="left", font=("Menlo", 11)).pack(anchor="w", pady=(8, 8))
         actions = ttk.Frame(profile)
@@ -235,11 +308,12 @@ class ControlCenterApp:
         ttk.Button(actions, text="Clear Session", command=self._clear_browser_session).pack(side="left")
         ttk.Label(
             frame,
-            text="First login is manual in the owned Chromium window. Password fields and auth state never enter MCP snapshots or audit metadata. Enable the four browser tools in Tools before using them from ChatGPT, then restart the bridge.",
+            text="First login is manual in the owned Chromium window. Password fields and auth state never enter MCP snapshots or audit metadata. The four browser tools are enabled by default; restart the bridge after policy changes.",
             wraplength=920,
         ).pack(anchor="w", pady=(16, 0))
 
     def refresh_all(self) -> None:
+        self._refresh_bridge_metrics()
         self._refresh_overview()
         self._refresh_scopes()
         self._refresh_tools()
@@ -248,6 +322,28 @@ class ControlCenterApp:
         self._refresh_runtime()
         self._refresh_browser()
 
+    def _refresh_bridge_metrics(self) -> dict[str, Any]:
+        bridge = self.broker.bridge_status()
+        self._bridge_status_cache = bridge
+        if hasattr(self, "bridge_metrics"):
+            self.bridge_metrics.set(format_bridge_metrics(bridge))
+        if hasattr(self, "runtime_bridge_metrics"):
+            self.runtime_bridge_metrics.set(format_bridge_metrics(bridge))
+        if hasattr(self, "runtime_mcp_state"):
+            state = "Bridge stale — restart required" if bridge.get("stale") else format_bridge_state(bridge)
+            self.runtime_mcp_state.set(f"Status: {state}")
+        return bridge
+
+    def _poll_bridge_status(self) -> None:
+        try:
+            self._refresh_bridge_metrics()
+            if hasattr(self, "tool_tree"):
+                self._refresh_tools()
+        finally:
+            try:
+                self._bridge_poll_job = self.root.after(BRIDGE_POLL_INTERVAL_MS, self._poll_bridge_status)
+            except tk.TclError:
+                self._bridge_poll_job = None
 
     def _refresh_overview(self) -> None:
         runtime = self.broker.invoke("runtime_status", actor="user")
@@ -260,6 +356,29 @@ class ControlCenterApp:
             f"ChatGPT path: {runtime.get('chatgpt_path')}\n"
             f"Approvals: {pending_count} pending, {approved_count} ready to apply"
         )
+        self._refresh_workspace_health()
+
+    def _refresh_workspace_health(self) -> None:
+        if not hasattr(self, "workspace_health_text"):
+            return
+        projects = [
+            scope for scope in self.broker.store.list_scopes(include_disabled=False)
+            if scope.kind == ScopeKind.PROJECT.value
+        ]
+        if not projects:
+            self.workspace_health_text.set("No registered project scope")
+            return
+        result = self.broker.invoke(
+            "workspace_observe",
+            {"project_id": projects[0].id, "max_items": 50},
+            actor="user",
+        )
+        if result.get("status") != "ok":
+            self.workspace_health_text.set(
+                f"Workspace health unavailable: {result.get('error_code', 'UNKNOWN_ERROR')}"
+            )
+            return
+        self.workspace_health_text.set(format_workspace_health(result))
 
     def _refresh_scopes(self) -> None:
         if not hasattr(self, "scope_tree"):
@@ -271,10 +390,23 @@ class ControlCenterApp:
             self.scope_tree.insert("", "end", iid=scope["id"], values=(scope["id"], scope["label"], scope["kind"], "yes" if scope["enabled"] else "no", "yes" if scope["expose_to_mcp"] else "no", permissions, scope.get("root", "")))
 
     def _refresh_tools(self) -> None:
+        selected = tuple(self.tool_tree.selection())
         for item in self.tool_tree.get_children():
             self.tool_tree.delete(item)
-        for row in self.broker.tool_rows():
+        rows = self.broker.tool_rows()
+        for row in rows:
             self.tool_tree.insert("", "end", iid=row["name"], values=(row["name"], row["group"], row["risk"], "yes" if row["enabled"] else "no", row["approval_mode"], row["description"]))
+        restored = tuple(name for name in selected if name in {row["name"] for row in rows})
+        if restored:
+            self.tool_tree.selection_set(*restored)
+        if hasattr(self, "tool_summary"):
+            bridge = self._bridge_status_cache
+            self.tool_summary.set(
+                f"Registry total: {bridge.get('registry_total', len(rows))}  |  "
+                f"Enabled: {bridge.get('enabled_count', sum(bool(row['enabled']) for row in rows))}  |  "
+                f"Running bridge tools: {bridge.get('running_tool_count', 0)}  |  "
+                f"{format_bridge_state(bridge)}"
+            )
 
     def _refresh_approvals(self) -> None:
         for item in self.approval_tree.get_children():
@@ -303,12 +435,14 @@ class ControlCenterApp:
     def _refresh_runtime(self) -> None:
         data = self.supervisor.status()
         self.runtime_text.set(format_runtime_status(data))
+        if hasattr(self, "runtime_bridge_metrics"):
+            self.runtime_bridge_metrics.set(format_bridge_metrics(self._bridge_status_cache))
 
     def _refresh_browser(self) -> None:
         if not hasattr(self, "browser_state"):
             return
         data = self.broker.browser.status()
-        sessions = [item for item in data.get("sessions", []) if item.get("profile") == "motion-erp"]
+        sessions = [item for item in data.get("sessions", []) if item.get("profile") == LOCAL_BROWSER_PROFILE_NAME]
         if not sessions:
             self.browser_state.set("Status: Browser stopped\nLogin state: Login required")
             return
@@ -320,13 +454,13 @@ class ControlCenterApp:
         )
 
     def _open_browser(self) -> None:
-        result = self.broker.invoke("browser_open", {"profile": "motion-erp"}, actor="user")
+        result = self.broker.invoke("browser_open", {"profile": LOCAL_BROWSER_PROFILE_NAME}, actor="user")
         if result.get("status") != "ok":
             messagebox.showerror("Browser", result.get("message", result.get("error_code", "Browser open failed")))
         self.refresh_all()
 
     def _clear_browser_session(self) -> None:
-        sessions = [item for item in self.broker.browser.status().get("sessions", []) if item.get("profile") == "motion-erp"]
+        sessions = [item for item in self.broker.browser.status().get("sessions", []) if item.get("profile") == LOCAL_BROWSER_PROFILE_NAME]
         if not sessions:
             self._refresh_browser()
             return
@@ -477,6 +611,14 @@ class ControlCenterApp:
         result = self.supervisor.start_mcp()
         if result.get("status") != "ok":
             messagebox.showerror("MCP bridge", result.get("message", result.get("error_code")))
+        self.refresh_all()
+
+    def _restart_bridge(self) -> None:
+        result = self.supervisor.restart_bridge()
+        if result.get("status") != "ok":
+            messagebox.showerror("MCP bridge", result.get("message", result.get("error_code")))
+        else:
+            messagebox.showinfo("MCP bridge", "Bridge restarted. The running tool list is now refreshed.")
         self.refresh_all()
 
     def _stop_mcp(self) -> None:
@@ -669,6 +811,12 @@ class ControlCenterApp:
         dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
 
     def _close(self) -> None:
+        if self._bridge_poll_job is not None:
+            try:
+                self.root.after_cancel(self._bridge_poll_job)
+            except tk.TclError:
+                pass
+            self._bridge_poll_job = None
         self.supervisor.stop("tunnel")
         self.supervisor.stop("mcp_bridge")
         self.broker.close()

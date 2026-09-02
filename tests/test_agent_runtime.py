@@ -4,11 +4,13 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 from local_mcp_control_center.agent_runtime import (
     AgentModelProfile,
     AgentRuntimeLimits,
     FakeModelProvider,
+    OpenAIChatProvider,
     ProviderResult,
 )
 from local_mcp_control_center.broker import Broker
@@ -64,6 +66,59 @@ def wait_for_task(broker: Broker, task_id: str, *, terminal: bool = True) -> dic
     raise AssertionError(f"task did not finish: {broker.agent_runtime.get_task(task_id)}")
 
 
+def test_openai_default_model_profile_uses_luna_max(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.delenv("LOCAL_MCP_AGENT_MODEL", raising=False)
+    monkeypatch.delenv("LOCAL_MCP_AGENT_REASONING_EFFORT", raising=False)
+    store = Store(tmp_path / "state" / "control.sqlite3", tmp_path / "state")
+    broker = Broker(store)
+    try:
+        enable_tools(broker, "agent_status")
+        status = broker.invoke("agent_status")
+        assert status["profiles"] == []
+        assert status["model_profiles"] == [
+            {
+                "name": "openai-default",
+                "provider": "openai",
+                "model": "gpt-5.6-luna",
+                "reasoning_effort": "max",
+                "allowed_roles": None,
+            }
+        ]
+    finally:
+        broker.close()
+
+
+def test_openai_provider_sends_reasoning_effort(monkeypatch) -> None:
+    provider = OpenAIChatProvider("test-key")
+    requests: list[dict[str, object]] = []
+
+    def fake_request(body: dict[str, object], *, timeout: float) -> dict[str, object]:
+        requests.append(body)
+        return {"choices": [{"message": {"content": '{"summary":"ok"}'}}]}
+
+    monkeypatch.setattr(provider, "_request", fake_request)
+    result = provider.run_agent(
+        task_id="task",
+        model="gpt-5.6-luna",
+        reasoning_effort="max",
+        capability_context=SimpleNamespace(to_dict=lambda: {}),
+        system_instructions="",
+        task="check",
+        tools=(),
+        call_tool=lambda _name, _arguments: {"status": "ok"},
+        cancel_event=threading.Event(),
+        deadline=time.monotonic() + 1,
+        max_steps=1,
+    )
+
+    assert result.summary == "ok"
+    assert requests[0]["model"] == "gpt-5.6-luna"
+    assert requests[0]["reasoning_effort"] == "max"
+    assert requests[0]["max_completion_tokens"] == 4_096
+    assert "max_tokens" not in requests[0]
+
+
 def test_provider_backed_implementer_is_persisted_and_isolated(tmp_path: Path) -> None:
     project = make_git_project(tmp_path / "project")
     store = Store(tmp_path / "state" / "control.sqlite3", tmp_path / "state")
@@ -111,6 +166,7 @@ def test_provider_backed_implementer_is_persisted_and_isolated(tmp_path: Path) -
         assert finished["source_dirty"] is False
         assert finished["source_head_commit"] == finished["base_commit"]
         assert provider.calls[0]["capability_context"]["role"] == "implementer"
+        assert provider.calls[0]["reasoning_effort"] == "max"
         assert provider.calls[0]["capability_context"]["worktree"] is True
         assert finished["worktree"]["isolated"] is True
         assert finished["worktree"]["cleanup"] == "explicit_only"

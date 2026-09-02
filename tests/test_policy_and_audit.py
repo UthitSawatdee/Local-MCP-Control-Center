@@ -139,3 +139,43 @@ def test_existing_policy_migrates_to_delete_only_approval(tmp_path: Path) -> Non
         assert engine.approval_required("delete_file", {"approval_mode": "never"}, "delete") is True
     finally:
         migrated.close()
+
+
+def test_existing_installation_enables_browser_tools_after_default_changes(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    db_path = state / "control.sqlite3"
+    browser_tools = ("browser_open", "browser_snapshot", "browser_run_command", "browser_close")
+
+    legacy = Store(db_path, state)
+    with legacy._lock:
+        legacy._conn.execute(
+            "DELETE FROM meta WHERE key='browser_tools_default_enabled_v1'"
+        )
+        legacy._conn.executemany(
+            "UPDATE tool_policies SET enabled=0 WHERE tool_name=?",
+            ((name,) for name in browser_tools),
+        )
+        legacy._conn.commit()
+    legacy.close()
+
+    migrated = Store(db_path, state)
+    try:
+        assert all(migrated.get_tool_policy(name).enabled for name in browser_tools)
+    finally:
+        migrated.close()
+
+    reopened = Store(db_path, state)
+    try:
+        with reopened._lock:
+            reopened._conn.execute(
+                "UPDATE tool_policies SET enabled=0 WHERE tool_name='browser_open'"
+            )
+            reopened._conn.commit()
+    finally:
+        reopened.close()
+
+    final = Store(db_path, state)
+    try:
+        assert final.get_tool_policy("browser_open").enabled is False
+    finally:
+        final.close()

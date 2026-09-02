@@ -10,6 +10,8 @@ from local_mcp_control_center.registry import TOOL_BY_NAME
 from local_mcp_control_center.runner import FixedRunner
 import local_mcp_control_center.runner as runner_module
 
+from .conftest import enable_tools
+
 
 def test_runner_rejects_arbitrary_profile(broker, workspace: Path) -> None:
     with pytest.raises(Exception) as error:
@@ -53,3 +55,43 @@ def test_bulk_move_tool_schema_requires_explicit_path_list(broker) -> None:
         "title": "Source Relative Paths",
         "type": "array",
     }
+
+
+def test_read_csv_exposes_bounded_structured_read_schema(broker) -> None:
+    server = build_server(broker)
+    tool = next(tool for tool in server._tool_manager.list_tools() if tool.name == "read_csv")
+    schema = tool.fn_metadata.arg_model.model_json_schema()
+
+    assert schema["required"] == ["scope_id", "relative_path"]
+    assert schema["properties"]["start_row"]["default"] == 1
+    assert schema["properties"]["max_rows"]["default"] == 200
+    assert schema["properties"]["max_columns"]["default"] == 50
+    assert schema["properties"]["delimiter"]["default"] == ","
+    assert schema["properties"]["delimiter"]["enum"] == [",", ";", "\t", "|"]
+
+
+def test_project_tools_expose_required_scope_id_in_mcp_schema(broker) -> None:
+    project_tools = (
+        "git_status",
+        "git_diff",
+        "git_log",
+        "git_create_branch",
+        "git_stage_paths",
+        "git_commit",
+        "git_restore_file",
+        "git_push",
+        "run_backend_test",
+        "run_frontend_test",
+        "run_targeted_test",
+        "run_lint",
+        "run_typecheck",
+        "run_build",
+    )
+    enable_tools(broker, *project_tools)
+    server = build_server(broker)
+    tools = {tool.name: tool for tool in server._tool_manager.list_tools()}
+
+    for name in project_tools:
+        schema = tools[name].fn_metadata.arg_model.model_json_schema()
+        assert schema["properties"]["scope_id"]["type"] == "string"
+        assert "scope_id" in schema["required"]

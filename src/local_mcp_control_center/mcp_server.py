@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from . import __version__
 from .broker import Broker
+from .browser import LOCAL_BROWSER_PROFILE_NAME
 
 
 SERVER_INSTRUCTIONS = (
@@ -17,13 +18,19 @@ SERVER_INSTRUCTIONS = (
     "after policy checks; bulk_move_files accepts only an explicit bounded list and "
     "preflights the complete batch before changing anything; delete_file, "
     "git_restore_file, and git_push are approval-gated dangerous operations. "
+    "Every project-bound Git and test/build tool requires an explicit scope_id; "
+    "call list_scopes first when working with multiple projects and pass the selected "
+    "project scope on every request. A missing or invalid scope must be corrected by "
+    "the caller and is never inferred from other visible projects. "
     "tool_batch accepts only its fixed READ-only child allowlist and still routes each child through the broker. "
+    "read_csv returns bounded structured rows from one UTF-8 CSV file using an explicit scope-relative path; "
+    "it supports comma, semicolon, tab, or pipe delimiters and never mutates the file. "
     "dependency_graph returns bounded relative metadata only. Delegated agent tools accept only a configured profile "
     "name and approved project scope; they do not accept executable, argv, environment, cwd, or PID inputs. "
     "Provider-backed Agent Task tools accept only predefined roles, bounded task text, approved scope IDs, and "
     "trusted model-profile names. The server derives role permissions and system instructions, persists lifecycle "
     "and results, and uses isolated Git worktrees for implementers. Workers cannot spawn workers or invoke shell. "
-    "There is no unrestricted shell, desktop automation, or child MCP bridge. Browser tools are opt-in, use only named profiles with exact origin allowlists, and accept no selectors, JavaScript, shell commands, credentials, or raw Playwright expressions."
+    "There is no unrestricted shell, desktop automation, or child MCP bridge. Browser tools are enabled by default, use only named profiles with their configured network policies (the current local-host profile permits HTTP/HTTPS internet access), and accept no selectors, JavaScript, shell commands, credentials, or raw Playwright expressions."
 )
 
 
@@ -61,6 +68,26 @@ def build_server(broker: Broker) -> MCPServer:
 
     def read_file(scope_id: str, relative_path: str) -> dict[str, Any]:
         return broker.invoke("read_file", {"scope_id": scope_id, "relative_path": relative_path})
+
+    def read_csv(
+        scope_id: str,
+        relative_path: str,
+        start_row: int = 1,
+        max_rows: int = 200,
+        max_columns: int = 50,
+        delimiter: Literal[",", ";", "\t", "|"] = ",",
+    ) -> dict[str, Any]:
+        return broker.invoke(
+            "read_csv",
+            {
+                "scope_id": scope_id,
+                "relative_path": relative_path,
+                "start_row": start_row,
+                "max_rows": max_rows,
+                "max_columns": max_columns,
+                "delimiter": delimiter,
+            },
+        )
 
     def search_text(scope_id: str, query: str, relative_path: str = ".", max_results: int = 100) -> dict[str, Any]:
         return broker.invoke("search_text", {"scope_id": scope_id, "query": query, "relative_path": relative_path, "max_results": max_results})
@@ -156,6 +183,40 @@ def build_server(broker: Broker) -> MCPServer:
     def workspace_snapshot(scope_id: str | None = None, max_items: int = 100) -> dict[str, Any]:
         args = {"scope_id": scope_id, "max_items": max_items}
         return broker.invoke("workspace_snapshot", {key: value for key, value in args.items() if value is not None})
+
+    def workspace_observe(project_id: str, max_items: int = 100) -> dict[str, Any]:
+        return broker.invoke("workspace_observe", {"project_id": project_id, "max_items": max_items})
+
+    def workspace_prepare(
+        project_id: str,
+        goal: str,
+        mode: Literal["diagnose", "implement", "review"] = "implement",
+        allowed_scope: list[str] | None = None,
+    ) -> dict[str, Any]:
+        args = {"project_id": project_id, "goal": goal, "mode": mode, "allowed_scope": allowed_scope}
+        return broker.invoke("workspace_prepare", {key: value for key, value in args.items() if value is not None})
+
+    def workspace_run_status(run_id: str) -> dict[str, Any]:
+        return broker.invoke("workspace_run_status", {"run_id": run_id})
+
+    def workspace_finish(run_id: str) -> dict[str, Any]:
+        return broker.invoke("workspace_finish", {"run_id": run_id})
+
+    def workspace_action_proposals(project_id: str | None = None) -> dict[str, Any]:
+        args = {} if project_id is None else {"project_id": project_id}
+        return broker.invoke("workspace_action_proposals", args)
+
+    def workspace_propose_action(
+        run_id: str,
+        action: Literal["owned_service_start", "owned_service_stop", "targeted_verification", "commit", "push"],
+        parameters: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        args = {
+            "run_id": run_id,
+            "action": action,
+            "parameters": parameters or {},
+        }
+        return broker.invoke("workspace_propose_action", args)
 
     def workspace_context(
         query: str,
@@ -459,55 +520,56 @@ def build_server(broker: Broker) -> MCPServer:
         }
         return broker.invoke("docx_edit", {key: value for key, value in args.items() if value is not None})
 
-    def git_status() -> dict[str, Any]:
-        return broker.invoke("git_status")
+    def git_status(scope_id: str) -> dict[str, Any]:
+        return broker.invoke("git_status", {"scope_id": scope_id})
 
-    def git_diff() -> dict[str, Any]:
-        return broker.invoke("git_diff")
+    def git_diff(scope_id: str) -> dict[str, Any]:
+        return broker.invoke("git_diff", {"scope_id": scope_id})
 
-    def git_log() -> dict[str, Any]:
-        return broker.invoke("git_log")
+    def git_log(scope_id: str) -> dict[str, Any]:
+        return broker.invoke("git_log", {"scope_id": scope_id})
 
-    def git_create_branch(branch: str) -> dict[str, Any]:
-        return broker.invoke("git_create_branch", {"branch": branch})
+    def git_create_branch(scope_id: str, branch: str) -> dict[str, Any]:
+        return broker.invoke("git_create_branch", {"scope_id": scope_id, "branch": branch})
 
-    def git_stage_paths(paths: list[str]) -> dict[str, Any]:
-        return broker.invoke("git_stage_paths", {"paths": paths})
+    def git_stage_paths(scope_id: str, paths: list[str]) -> dict[str, Any]:
+        return broker.invoke("git_stage_paths", {"scope_id": scope_id, "paths": paths})
 
-    def git_commit(message: str, paths: list[str]) -> dict[str, Any]:
-        return broker.invoke("git_commit", {"message": message, "paths": paths})
+    def git_commit(scope_id: str, paths: list[str], message: str) -> dict[str, Any]:
+        return broker.invoke("git_commit", {"scope_id": scope_id, "message": message, "paths": paths})
 
-    def git_restore_file(path: str, expected_hash: str | None = None) -> dict[str, Any]:
-        args = {"path": path, "expected_hash": expected_hash}
+    def git_restore_file(scope_id: str, path: str, expected_hash: str | None = None) -> dict[str, Any]:
+        args = {"scope_id": scope_id, "path": path, "expected_hash": expected_hash}
         return broker.invoke("git_restore_file", {key: value for key, value in args.items() if value is not None})
 
-    def git_push(remote: str = "origin", branch: str | None = None) -> dict[str, Any]:
-        args = {"remote": remote, "branch": branch}
+    def git_push(scope_id: str, remote: str = "origin", branch: str | None = None) -> dict[str, Any]:
+        args = {"scope_id": scope_id, "remote": remote, "branch": branch}
         return broker.invoke("git_push", {key: value for key, value in args.items() if value is not None})
 
-    def run_backend_test() -> dict[str, Any]:
-        return broker.invoke("run_backend_test")
+    def run_backend_test(scope_id: str) -> dict[str, Any]:
+        return broker.invoke("run_backend_test", {"scope_id": scope_id})
 
-    def run_frontend_test() -> dict[str, Any]:
-        return broker.invoke("run_frontend_test")
+    def run_frontend_test(scope_id: str) -> dict[str, Any]:
+        return broker.invoke("run_frontend_test", {"scope_id": scope_id})
 
     def run_targeted_test(
+        scope_id: str,
         target: str,
         test_path: str | None = None,
         test_file: str | None = None,
     ) -> dict[str, Any]:
-        args = {"target": target, "test_path": test_path, "test_file": test_file}
+        args = {"scope_id": scope_id, "target": target, "test_path": test_path, "test_file": test_file}
         return broker.invoke("run_targeted_test", {key: value for key, value in args.items() if value is not None})
 
-    def run_lint(target: str = "auto") -> dict[str, Any]:
-        return broker.invoke("run_lint", {"target": target})
+    def run_lint(scope_id: str, target: str = "auto") -> dict[str, Any]:
+        return broker.invoke("run_lint", {"scope_id": scope_id, "target": target})
 
-    def run_typecheck(target: str = "auto") -> dict[str, Any]:
-        return broker.invoke("run_typecheck", {"target": target})
+    def run_typecheck(scope_id: str, target: str = "auto") -> dict[str, Any]:
+        return broker.invoke("run_typecheck", {"scope_id": scope_id, "target": target})
 
-    def run_build(target: str | None = None) -> dict[str, Any]:
-        args = {} if target is None else {"target": target}
-        return broker.invoke("run_build", args)
+    def run_build(scope_id: str, target: str | None = None) -> dict[str, Any]:
+        args = {"scope_id": scope_id, "target": target}
+        return broker.invoke("run_build", {key: value for key, value in args.items() if value is not None})
 
     def process_start_profile(
         scope_id: str,
@@ -523,7 +585,7 @@ def build_server(broker: Broker) -> MCPServer:
     def runtime_status() -> dict[str, Any]:
         return broker.invoke("runtime_status")
 
-    def browser_open(profile: Literal["motion-erp"]) -> dict[str, Any]:
+    def browser_open(profile: Literal[LOCAL_BROWSER_PROFILE_NAME]) -> dict[str, Any]:
         return broker.invoke("browser_open", {"profile": profile})
 
     def browser_snapshot(
@@ -565,6 +627,7 @@ def build_server(broker: Broker) -> MCPServer:
     register("list_scopes", list_scopes)
     register("list_files", list_files)
     register("read_file", read_file)
+    register("read_csv", read_csv)
     register("search_text", search_text)
     register("apply_patch", apply_patch)
     register("read_many_files", read_many_files)
@@ -576,6 +639,12 @@ def build_server(broker: Broker) -> MCPServer:
     register("process_status", process_status)
     register("process_logs", process_logs)
     register("workspace_snapshot", workspace_snapshot)
+    register("workspace_observe", workspace_observe)
+    register("workspace_prepare", workspace_prepare)
+    register("workspace_run_status", workspace_run_status)
+    register("workspace_finish", workspace_finish)
+    register("workspace_action_proposals", workspace_action_proposals)
+    register("workspace_propose_action", workspace_propose_action)
     register("workspace_context", workspace_context)
     register("dependency_graph", dependency_graph)
     register("agent_status", agent_status)
@@ -632,4 +701,10 @@ def build_server(broker: Broker) -> MCPServer:
 
 def run_stdio(broker: Broker) -> None:
     """Run the bridge over MCP stdio for tunnel-client or another MCP host."""
-    build_server(broker).run(transport="stdio")
+    server = build_server(broker)
+    registered_tool_count = len(server._tool_manager.list_tools())
+    broker.record_mcp_bridge_snapshot(registered_tool_count)
+    try:
+        server.run(transport="stdio")
+    finally:
+        broker.clear_mcp_bridge_snapshot()

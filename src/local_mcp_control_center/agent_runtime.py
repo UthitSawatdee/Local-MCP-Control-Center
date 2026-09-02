@@ -48,6 +48,9 @@ MAX_RUNTIME_SECONDS = 3_600.0
 MAX_CONCURRENT_WORKERS = 16
 MAX_WORKERS_PER_ROOT = 32
 MAX_LIST_LIMIT = 100
+DEFAULT_AGENT_MODEL = "gpt-5.6-luna"
+DEFAULT_AGENT_REASONING_EFFORT = "max"
+REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
 
 _PROFILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
 _PROVIDER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
@@ -81,6 +84,7 @@ class AgentModelProvider(Protocol):
         *,
         task_id: str,
         model: str,
+        reasoning_effort: str,
         capability_context: "AgentCapabilityContext",
         system_instructions: str,
         task: str,
@@ -117,6 +121,7 @@ class AgentModelProfile:
     model: str
     provider: AgentModelProvider
     allowed_roles: frozenset[str] | None = None
+    reasoning_effort: str = DEFAULT_AGENT_REASONING_EFFORT
 
     def __post_init__(self) -> None:
         if isinstance(self.allowed_roles, (set, list, tuple)):
@@ -127,6 +132,8 @@ class AgentModelProfile:
             raise PolicyError("MODEL_PROFILE_INVALID", "provider name is invalid")
         if not _MODEL_RE.fullmatch(self.model) or len(self.model.encode("utf-8")) > MAX_MODEL_NAME_BYTES:
             raise PolicyError("MODEL_PROFILE_INVALID", "model name is invalid")
+        if not isinstance(self.reasoning_effort, str) or self.reasoning_effort not in REASONING_EFFORTS:
+            raise PolicyError("MODEL_PROFILE_INVALID", "reasoning effort is invalid")
         if self.allowed_roles is not None:
             unknown = set(self.allowed_roles) - {role.value for role in AgentRole}
             if unknown:
@@ -137,6 +144,7 @@ class AgentModelProfile:
             "name": self.name,
             "provider": self.provider_name,
             "model": self.model,
+            "reasoning_effort": self.reasoning_effort,
             "allowed_roles": sorted(self.allowed_roles) if self.allowed_roles is not None else None,
         }
 
@@ -301,6 +309,7 @@ class FakeModelProvider:
             {
                 "task_id": kwargs.get("task_id"),
                 "model": kwargs.get("model"),
+                "reasoning_effort": kwargs.get("reasoning_effort"),
                 "capability_context": (
                     kwargs["capability_context"].to_dict()
                     if isinstance(kwargs.get("capability_context"), AgentCapabilityContext)
@@ -351,6 +360,7 @@ class OpenAIChatProvider:
         *,
         task_id: str,
         model: str,
+        reasoning_effort: str = DEFAULT_AGENT_REASONING_EFFORT,
         capability_context: "AgentCapabilityContext",
         system_instructions: str,
         task: str,
@@ -392,8 +402,8 @@ class OpenAIChatProvider:
             request_body: dict[str, Any] = {
                 "model": model,
                 "messages": messages,
-                "max_tokens": 4_096,
-                "temperature": 0,
+                "max_completion_tokens": 4_096,
+                "reasoning_effort": reasoning_effort,
                 "response_format": {"type": "json_object"},
             }
             if tool_payload:
@@ -744,10 +754,24 @@ class AgentRuntimeService:
                 self.register_model_profile(profile)
         live = OpenAIChatProvider.from_environment()
         if live is not None and "openai-default" not in self._providers:
-            model = os.environ.get("LOCAL_MCP_AGENT_MODEL", "gpt-5.6-luna")
+            model = os.environ.get("LOCAL_MCP_AGENT_MODEL", DEFAULT_AGENT_MODEL)
             if not _MODEL_RE.fullmatch(model):
-                model = "gpt-5.6-luna"
-            self.register_model_profile(AgentModelProfile("openai-default", "openai", model, live))
+                raise PolicyError("PROVIDER_CONFIG_INVALID", "LOCAL_MCP_AGENT_MODEL is invalid")
+            reasoning_effort = os.environ.get(
+                "LOCAL_MCP_AGENT_REASONING_EFFORT",
+                DEFAULT_AGENT_REASONING_EFFORT,
+            )
+            if reasoning_effort not in REASONING_EFFORTS:
+                raise PolicyError("PROVIDER_CONFIG_INVALID", "LOCAL_MCP_AGENT_REASONING_EFFORT is invalid")
+            self.register_model_profile(
+                AgentModelProfile(
+                    "openai-default",
+                    "openai",
+                    model,
+                    live,
+                    reasoning_effort=reasoning_effort,
+                )
+            )
         self._recover_incomplete_tasks()
 
     def register_model_profile(self, profile: AgentModelProfile) -> None:
@@ -1089,6 +1113,7 @@ class AgentRuntimeService:
             result = profile.provider.run_agent(
                 task_id=task_id,
                 model=profile.model,
+                reasoning_effort=profile.reasoning_effort,
                 capability_context=context,
                 system_instructions=role_profile.system_instructions,
                 task=str(row["task_text"]),
@@ -1554,9 +1579,12 @@ __all__ = [
     "AgentRuntimeLimits",
     "AgentRuntimeService",
     "AgentRuntimeError",
+    "DEFAULT_AGENT_MODEL",
+    "DEFAULT_AGENT_REASONING_EFFORT",
     "FakeModelProvider",
     "OpenAIChatProvider",
     "ProviderResult",
+    "REASONING_EFFORTS",
     "ROLE_PROFILES",
     "RoleProfile",
 ]

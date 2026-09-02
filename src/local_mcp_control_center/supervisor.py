@@ -16,6 +16,9 @@ from .storage import Store
 from .tunnel import TunnelClientAdapter
 
 
+_ACTIVE_RUNTIME_STATES = frozenset({"starting", "running", "healthy", "ready", "unhealthy"})
+
+
 class RuntimeSupervisor:
     """Owns only processes launched by this app; never kills by broad process name."""
 
@@ -270,6 +273,27 @@ class RuntimeSupervisor:
             "health_file": str(health_file),
             "health": self.tunnel_client.health(health_file),
             "control_plane": control_plane,
+        }
+
+    def restart_bridge(self) -> dict[str, Any]:
+        """Restart the active standalone bridge or tunnel-managed bridge."""
+        tunnel_state = self._tunnel_status().get("state")
+        if tunnel_state in _ACTIVE_RUNTIME_STATES:
+            stopped = self.stop("tunnel")
+            if stopped.get("status") != "ok":
+                return stopped
+            return self.start_tunnel()
+
+        if self._alive("mcp_bridge") or self._persisted_process("mcp_bridge"):
+            stopped = self.stop("mcp_bridge")
+            if stopped.get("status") != "ok":
+                return stopped
+            return self.start_mcp()
+
+        return {
+            "status": "denied",
+            "error_code": "BRIDGE_NOT_RUNNING",
+            "message": "No running MCP bridge or secure tunnel was found.",
         }
 
     def stop(self, kind: str) -> dict[str, Any]:

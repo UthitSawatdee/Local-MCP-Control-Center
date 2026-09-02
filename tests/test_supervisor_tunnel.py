@@ -155,3 +155,19 @@ def test_start_stops_tunnel_when_initial_control_plane_auth_is_unauthorized(tmp_
         assert store.get_runtime("tunnel")["state"] == "stopped"
     finally:
         store.close()
+
+
+def test_restart_bridge_restarts_the_tunnel_managed_bridge(tmp_path: Path, monkeypatch) -> None:
+    store = Store(tmp_path / "state" / "control.sqlite3", tmp_path / "state")
+    supervisor = RuntimeSupervisor(store, AuditLog(store))
+    calls: list[str] = []
+    monkeypatch.setattr(supervisor, "_tunnel_status", lambda: {"state": "ready"})
+    monkeypatch.setattr(supervisor, "stop", lambda kind: calls.append(f"stop:{kind}") or {"status": "ok"})
+    monkeypatch.setattr(supervisor, "start_tunnel", lambda: calls.append("start:tunnel") or {"status": "ok", "state": "running"})
+    try:
+        result = supervisor.restart_bridge()
+
+        assert result == {"status": "ok", "state": "running"}
+        assert calls == ["stop:tunnel", "start:tunnel"]
+    finally:
+        store.close()

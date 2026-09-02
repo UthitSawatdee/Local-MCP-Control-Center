@@ -16,8 +16,10 @@ from .runner import CommandResult, FixedRunner, TRUSTED_BIN_DIRS, display_argv
 
 BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,119}$")
 REMOTE_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
+COMMIT_RE = re.compile(r"^[0-9a-f]{40,64}$")
 ALLOWED_OPERATIONS = {
     "current_branch": "branch",
+    "current_head": "rev-parse",
     "create_branch": "switch",
     "stage": "add",
     "stage_for_commit": "add",
@@ -158,6 +160,10 @@ class GitAdapter:
             if args != ["branch", "--show-current"]:
                 raise PolicyError("GIT_OPERATION_NOT_ALLOWED", "current branch arguments are fixed")
             return
+        if operation == "current_head":
+            if args != ["rev-parse", "--verify", "HEAD"]:
+                raise PolicyError("GIT_OPERATION_NOT_ALLOWED", "current HEAD arguments are fixed")
+            return
         if operation == "create_branch":
             if len(args) != 3 or args[1] != "-c":
                 raise PolicyError("GIT_OPERATION_NOT_ALLOWED", "branch creation arguments are fixed")
@@ -192,3 +198,12 @@ class GitAdapter:
             return None
         value = result.stdout.strip()
         return value or None
+
+    @staticmethod
+    def current_head(result: CommandResult) -> str | None:
+        if result.exit_code != 0:
+            return None
+        value = result.stdout.strip().casefold()
+        if not COMMIT_RE.fullmatch(value):
+            raise PolicyError("GIT_RESULT_INVALID", "Git returned an invalid HEAD commit")
+        return value

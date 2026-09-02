@@ -32,6 +32,24 @@ def test_runtime_summary_shows_only_key_suffix_and_connection_state() -> None:
     assert "sk-" not in summary
 
 
+def test_bridge_metrics_separate_registry_policy_and_live_counts() -> None:
+    summary = gui.format_bridge_metrics(
+        {
+            "registry_total": 61,
+            "enabled_count": 35,
+            "running_tool_count": 34,
+            "state": "stale",
+            "stale": True,
+        }
+    )
+
+    assert "Registry total: 61" in summary
+    assert "Enabled: 35" in summary
+    assert "Running bridge tools: 34" in summary
+    assert "Bridge stale" in summary
+    assert "Restart bridge" in summary
+
+
 def test_doctor_uses_a_dismissible_output_dialog(monkeypatch) -> None:
     app = object.__new__(gui.ControlCenterApp)
     app.supervisor = SimpleNamespace(
