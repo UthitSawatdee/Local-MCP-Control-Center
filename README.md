@@ -1,5 +1,10 @@
 # Local MCP Control Center
 
+## Codex Thread Reader (optional)
+
+เพิ่ม `codex_status`, `codex_list_threads` และ `codex_read_thread` สำหรับอ่านประวัติจาก Codex App Server โดยไม่ resume งาน เปิดสิทธิ์จาก **Tools → Configure Codex** แล้ว restart bridge ก่อนใช้งาน รองรับลิงก์ `codex://threads/<UUID>` และการอ่านทีละหน้า ดูวิธีติดตั้ง ข้อจำกัด และ live smoke test ใน [Codex Thread Reader](docs/CODEX_THREADS.md) การทดสอบอัตโนมัติใช้ข้อมูลจำลอง ไม่ได้ยืนยันว่าอ่าน thread จริงบนเครื่องได้แล้ว
+
+
 macOS-first local control center สำหรับ MCP แบบ least privilege ตาม blueprint ของโปรเจกต์นี้ โดยรุ่นปัจจุบันมี tunnel-client integration สำหรับ Secure MCP Tunnel แล้ว
 
 รุ่นนี้ตั้งใจให้ runnable และตรวจสอบได้บน Python/Tkinter ก่อน โดยแยกชั้นสำคัญไว้ชัดเจน:
@@ -20,17 +25,17 @@ macOS-first local control center สำหรับ MCP แบบ least privileg
 
 ## ติดตั้ง
 
+ต้องใช้ Python 3.12 ขึ้นไป และ Python ที่มี Tkinter สำหรับเปิด GUI
+
 ```text
 cd /path/to/local-mcp-control-center
 python3 -m venv .venv
-.venv/bin/python -m pip install -e '.[dev]'
+.venv/bin/python -m pip install '.[dev]'
 ```
 
-ถ้าใช้ checkout นี้โดยตรง ให้ใช้ path เต็มของโฟลเดอร์:
+เปลี่ยน `/path/to/local-mcp-control-center` เป็น checkout บนเครื่องของคุณ ผู้ใช้แต่ละคนต้องสร้าง virtual environment, allowed scopes และ tunnel configuration ของตัวเอง ไม่คัดลอก Keychain, ฐานข้อมูล runtime หรือ browser session จากเครื่องผู้พัฒนา
 
-```text
-/Users/indierockbadgirl/Documents/Codex/2026-08-29/referenced-chatgpt-conversation-this-is-an/outputs/local-mcp-control-center
-```
+ก่อน commit, push หรือแจกจ่าย ดู [Release checklist](docs/RELEASE_CHECKLIST.md)
 
 ## วิธีใช้งานจริง
 
@@ -92,9 +97,29 @@ Permission class มี `READ`, `WRITE`, `EXECUTE`, `DANGEROUS` และแย�
 5. ใช้ `git_stage_paths(scope_id=..., paths=...)`/`git_commit(scope_id=..., paths=..., message=...)` กับ path ที่ระบุชัดเจนเท่านั้น
 6. ใช้ `git_restore_file(scope_id=...)`, `git_push(scope_id=...)` หรือ `delete_file` ได้เฉพาะหลัง `Approve once → Apply approved`
 
+Git stage/commit รองรับไฟล์ที่ถูกลบและ staged ไว้แล้ว รวมถึง path ที่ parent directory หายไป โดยยังคงใช้รายการ path ที่เลือกแบบ exact เท่านั้น ไม่แปลงเป็น wildcard หรือทั้ง repository
+
 `apply_patch` ไม่ใช้ fuzzy matching; หาก context/hash เปลี่ยนจะคืน `PRECONDITION_CHANGED` หรือ `PATCH_CONTEXT_MISMATCH` และไม่เขียนทับเวอร์ชันใหม่. Paged read ใช้ continuation token ที่ผูกกับ actor, scope, path และ content hash. Context/index เป็นตัวช่วยจัดลำดับความเกี่ยวข้อง ไม่ใช่ตัวตัดสิน authorization
 
 Process ใช้เฉพาะ executable/argument array จาก ProjectProfile หรือ explicit `AgentProfile`, `shell=False`, isolated runtime environment, process group ที่ Control Center เป็นเจ้าของ และ log สูงสุด 1 MiB พร้อม redaction. Git ไม่มี generic `git(args[])`; `reset`, `clean`, force push, recursive delete และ credential access ยังไม่เปิดใช้งาน. Browser automation V1 ใช้ `BrowserManager` + Playwright หลัง Broker ด้วย named profile/origin allowlist และ declarative snapshot refs; ไม่มี shell, JavaScript, arbitrary selector หรือ child-MCP forwarding. อ่านรายละเอียดใน [Browser Automation V1](docs/BROWSER_AUTOMATION.md)
+
+### Motion ERP Calendar → Timesheet
+
+Motion ERP ใช้ browser profile เดิมสำหรับ login/session แต่ business operations ถูกจำกัดเป็น fixed adapters แทน arbitrary RPC:
+
+```text
+browser_open / browser_run_command
+        ↓ manual login เมื่อ session หมดอายุ
+motion_calendar_month
+        ↓ map ชื่อ task/project
+motion_project_task_search
+        ↓ ตรวจข้อมูลที่ลงแล้ว
+motion_timesheet_month
+        ↓ preview ก่อนเสมอ
+motion_timesheet_create_missing(dry_run=true → false)
+```
+
+`motion_timesheet_create_missing` สร้างได้เฉพาะ row ใหม่จาก date/project/task/description/hours ที่ระบุชัดเจน, skip exact duplicate, block batch เมื่อเจอ record key เดิมแต่ชั่วโมงต่างกัน และไม่มี update/delete surface. Caller ไม่สามารถส่ง RPC URL, model, method, cookie, credential หรือ arbitrary Odoo domain เองได้
 
 `tool_batch` มี parent scope เป็น anchor แต่ child ทุกตัวเรียกผ่าน Broker ใหม่และต้องผ่าน schema, tool policy, capability, path policy และ audit ของตัวเอง. `workspace_context` รับ `delivery_key` แบบ optional เพื่อเก็บเพียง digest ใน in-memory ledger; เมื่อ context เดิมไม่เปลี่ยนจะละเว้น snippets ซ้ำ. `dependency_graph` คืนเฉพาะ relative metadata/edges/diagnostics และมี bounds ของ files, edges, bytes และ output.
 
@@ -146,33 +171,33 @@ cd /path/to/local-mcp-control-center
 
 คำสั่งนี้จะสร้าง `~/Applications/Local MCP Control Center.app` โดยใช้ checkout และ `.venv` ปัจจุบัน หลังจากสร้างแล้วให้ดับเบิลคลิกจาก Applications หรือ drag ไปไว้ที่ Dock ได้เลย แอปจะเปิด Tkinter GUI โดยตรงและเขียน log ของ launcher ไว้ที่ `~/Library/Application Support/LocalMCPControlCenter/logs/gui-launcher.log` หากย้าย repository หรือสร้าง `.venv` ใหม่ ให้เรียกคำสั่งสร้าง app อีกครั้ง
 
-## เริ่มใช้งานกับ Project-ATM-Coperation
+## เริ่มใช้งานกับโปรเจกต์ของคุณ
 
-เพิ่ม scope แบบ read-only และยังไม่ expose ให้ MCP:
+เพิ่ม scope แบบ read-only และยังไม่ expose ให้ MCP โดยเปลี่ยน root ให้ตรงกับโฟลเดอร์ที่ต้องการอนุญาตจริง:
 
 ```text
-.venv/bin/local-mcp --data-dir '/Users/indierockbadgirl/Library/Application Support/LocalMCPControlCenter' add-scope \
-  --scope-id atm-project \
-  --label 'Project ATM Coperation' \
+.venv/bin/local-mcp --data-dir "$HOME/Library/Application Support/LocalMCPControlCenter" add-scope \
+  --scope-id my-project \
+  --label 'My Project' \
   --kind project \
-  --root '/Users/indierockbadgirl/Desktop/for-work/Project/Project-ATM-Coperation'
+  --root "$HOME/Projects/my-project"
 ```
 
 ถ้าต้องการให้ ChatGPT เห็น scope นี้ตั้งแต่ต้น ให้เพิ่ม `--expose` หลังจากตรวจ path แล้ว:
 
 ```text
-.venv/bin/local-mcp --data-dir '/Users/indierockbadgirl/Library/Application Support/LocalMCPControlCenter' add-scope \
-  --scope-id atm-project \
-  --label 'Project ATM Coperation' \
+.venv/bin/local-mcp --data-dir "$HOME/Library/Application Support/LocalMCPControlCenter" add-scope \
+  --scope-id my-project \
+  --label 'My Project' \
   --kind project \
-  --root '/Users/indierockbadgirl/Desktop/for-work/Project/Project-ATM-Coperation' \
+  --root "$HOME/Projects/my-project" \
   --expose
 ```
 
 เปิด GUI:
 
 ```text
-.venv/bin/local-mcp --data-dir '/Users/indierockbadgirl/Library/Application Support/LocalMCPControlCenter' gui
+.venv/bin/local-mcp --data-dir "$HOME/Library/Application Support/LocalMCPControlCenter" gui
 ```
 
 ใน GUI ให้เลือก scope แล้วเปิด capability ทีละรายการตามงานจริง โดย policy ของรุ่นนี้คือ:
@@ -182,7 +207,7 @@ cd /path/to/local-mcp-control-center
 - `create_directory`: สร้างโฟลเดอร์ใหม่ได้ครั้งละหนึ่งโฟลเดอร์ใต้ parent ที่มีอยู่แล้ว โดยใช้ capability `create`; ไม่สร้าง parent ซ้อนอัตโนมัติและไม่เขียนทับเป้าหมายเดิม
 - `bulk_move_files`: ย้ายไฟล์หลายไฟล์ในคำขอเดียวได้ โดยต้องส่งรายการ `source_relative_paths` ที่ระบุชื่อไฟล์ชัดเจนและส่งปลายทางเป็น directory เดียวกัน; ระบบจะตรวจและ hash ทุกไฟล์ก่อนเริ่ม, ไม่รับ wildcard, ไม่เขียนทับปลายทาง และคืน mapping ของทุกไฟล์
 - `delete`: เมื่อเปิดแล้วจึงลบได้ แต่ทุกคำขอต้องกด `Approve once` และ `Apply approved`
-- `Expose to MCP`: เปิดเฉพาะ scope ที่ต้องการให้ ChatGPT เห็น
+- `Expose to MCP`: scope ที่เลือกผ่านปุ่ม Add ใน GUI จะเริ่มต้นเป็น MCP-visible แบบ read-only เพื่อให้ใช้งานได้ทันที; ปิดได้จาก policy ของ scope. คำสั่ง CLI ต้องระบุ `--expose` เอง
 - CSV/Excel/Word, test และ build: ทำงานทันทีเมื่อเปิด tool และ capability ที่เกี่ยวข้อง
 
 ในแท็บ Allowed Paths สามารถเลือกได้ทั้ง folder scope และ file scope; file scope จะเห็นได้เฉพาะไฟล์ที่เลือกและใช้ relative path เป็น `.`
@@ -200,10 +225,10 @@ cd /path/to/local-mcp-control-center
 ## คำสั่งตรวจสอบแบบไม่เปิด GUI
 
 ```text
-.venv/bin/local-mcp --data-dir '/Users/indierockbadgirl/Library/Application Support/LocalMCPControlCenter' list-scopes
-.venv/bin/local-mcp --data-dir '/Users/indierockbadgirl/Library/Application Support/LocalMCPControlCenter' list-tools
-.venv/bin/local-mcp --data-dir '/Users/indierockbadgirl/Library/Application Support/LocalMCPControlCenter' pending-approvals
-.venv/bin/local-mcp --data-dir '/Users/indierockbadgirl/Library/Application Support/LocalMCPControlCenter' verify-audit
+.venv/bin/local-mcp --data-dir "$HOME/Library/Application Support/LocalMCPControlCenter" list-scopes
+.venv/bin/local-mcp --data-dir "$HOME/Library/Application Support/LocalMCPControlCenter" list-tools
+.venv/bin/local-mcp --data-dir "$HOME/Library/Application Support/LocalMCPControlCenter" pending-approvals
+.venv/bin/local-mcp --data-dir "$HOME/Library/Application Support/LocalMCPControlCenter" verify-audit
 ```
 
 ## MCP/tunnel lifecycle
@@ -211,7 +236,7 @@ cd /path/to/local-mcp-control-center
 คำสั่ง `mcp` เปิด MCP bridge ผ่าน stdio สำหรับให้ tunnel client ที่ถูกตั้งค่าไว้เป็นผู้ถือ stdio connection:
 
 ```text
-.venv/bin/local-mcp --data-dir '/Users/indierockbadgirl/Library/Application Support/LocalMCPControlCenter' mcp
+.venv/bin/local-mcp --data-dir "$HOME/Library/Application Support/LocalMCPControlCenter" mcp
 ```
 
 GUI มีปุ่ม `Configure tunnel`, `Run tunnel doctor`, `Start tunnel` และ `Stop tunnel` แล้ว
@@ -272,4 +297,4 @@ brew install openai/tools/tunnel-client
 
 Tunnel integration ในรุ่นนี้ใช้งานจริงผ่าน binary `tunnel-client` และ macOS Keychain แล้ว แต่ยังต้องให้ผู้ใช้สร้าง tunnel/permissions ใน Platform และผูก app ใน ChatGPT เอง เพราะเป็นขั้นตอน account/workspace ที่โปรแกรมไม่ควรทำแทนโดยเดา credential
 
-Developer runtime นี้มี context ledger แบบ in-memory bounded, dependency/import graph, delegated-agent compatibility manager, provider-backed Agent Task runtime แบบ persisted และ Browser Automation V1 แบบ allowlist แล้ว แต่ยังไม่รวม file watcher, arbitrary child MCP bridge, desktop/UI automation, automatic merge/push หรือ OS-level sandbox. Browser business adapters สำหรับ Motion ERP เป็น Phase 2 แยกต่างหาก; worker provider ปัจจุบันใช้ local thread และ fixed/scrubbed adapters จึงไม่อ้างว่าเป็น hostile-code sandbox
+Developer runtime นี้มี context ledger แบบ in-memory bounded, dependency/import graph, delegated-agent compatibility manager, provider-backed Agent Task runtime แบบ persisted, Browser Automation V1 แบบ allowlist และ fixed Motion ERP Calendar/Timesheet adapters แล้ว แต่ยังไม่รวม file watcher, arbitrary child MCP bridge, desktop/UI automation, automatic merge/push หรือ OS-level sandbox. Motion ERP adapters เปิดเฉพาะ business operations ที่ allowlist ไว้และไม่เปิด generic Odoo RPC; worker provider ปัจจุบันใช้ local thread และ fixed/scrubbed adapters จึงไม่อ้างว่าเป็น hostile-code sandbox

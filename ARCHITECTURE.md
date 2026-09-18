@@ -361,8 +361,8 @@ Settings  ──── * AuditEvent
 2. ปฏิเสธ absolute path และ path ที่มี ..
 3. canonicalize root และ target
 4. สำหรับ target ใหม่ ให้ canonicalize nearest existing parent
-5. ปฏิเสธ symlink ที่พาออกนอก root; MVP ปฏิเสธ symlink path ทั้งหมด
-6. หา scope ที่ตรง; MVP ปฏิเสธ overlapping scopes เพื่อให้ผล deterministic
+5. canonicalize symlink ที่ผู้ใช้เลือกเป็น scope root แล้วตรวจ protected/broad roots; symlink ภายใน scope ที่พาออกนอก root ยังถูกปฏิเสธ
+6. หา scope จาก `scope_id` ที่ระบุชัด; nested/overlapping roots ทำได้เมื่อเป็นคนละ scope แต่ exact duplicate root ยังถูกปฏิเสธ
 7. ตรวจ protected-target rules; deny มี precedence
 8. ตรวจ scope enabled + expose_to_mcp
 9. ตรวจ Tool enabled
@@ -606,7 +606,7 @@ local-mcp-control-center/
   "id": "atm-project",
   "label": "Project ATM Coperation",
   "kind": "project",
-  "root": "/Users/indierockbadgirl/Desktop/for-work/Project/Project-ATM-Coperation",
+  "root": "/path/to/your/project",
   "expose_to_mcp": true,
   "permissions": {
     "read": "allow",
@@ -779,8 +779,8 @@ RUNTIME_NOT_READY
 ### Policy tests
 
 - `../secret.txt`, absolute path, encoded traversal และ NUL
-- root เป็น symlink, child เป็น symlink, symlink เปลี่ยนหลัง preflight
-- overlap ของ scopes และ protected path precedence
+- child เป็น symlink, symlink เปลี่ยนหลัง preflight, หรือ selected root resolves into a protected/broad root
+- exact duplicate scope roots, explicit overlapping scopes และ protected path precedence
 - read ไม่ grant write; create ไม่ grant overwrite
 - move ต้องผ่าน source/destination ทั้งคู่
 - delete directory/recursive ถูกปฏิเสธ
@@ -910,7 +910,7 @@ Every lifecycle transition and worktree creation is written to the existing reda
 
 ### Existing compatibility and deferred scope
 
-The original MCP tools and the earlier fixed-profile delegated-agent compatibility path remain registered; the provider-backed API is additive. The runtime uses local threads and fixed/scrubbed adapters, not an OS-level hostile-code sandbox. Automatic merge/push, autonomous planning, child MCP/desktop automation, distributed workers, queue infrastructure, Motion-specific browser business adapters and unrelated MRP changes remain out of scope for V1. Generic Browser Automation V1 is documented in `docs/BROWSER_AUTOMATION.md` and remains behind the existing Broker/audit path.
+The original MCP tools and the earlier fixed-profile delegated-agent compatibility path remain registered; the provider-backed API is additive. The runtime uses local threads and fixed/scrubbed adapters, not an OS-level hostile-code sandbox. Automatic merge/push, autonomous planning, child MCP/desktop automation, distributed workers, queue infrastructure and unrelated MRP changes remain out of scope for V1. Generic Browser Automation V1 remains behind the Broker/audit path, and Motion ERP adds only fixed Calendar/Project/Task/Timesheet operations over the authenticated owned browser session; raw Odoo RPC URLs, models, methods, cookies and credentials are not MCP inputs.
 
 ## 18. Actual DevOS WorkspaceEngine Foundation
 
