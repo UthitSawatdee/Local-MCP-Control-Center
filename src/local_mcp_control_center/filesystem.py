@@ -98,7 +98,14 @@ def validate_relative_path(relative_path: str) -> list[str]:
 class SafeFilesystem:
     """Filesystem adapter that requires already-authorized, canonical paths."""
 
-    def resolve_under(self, root: Path, relative_path: str, *, must_exist: bool = False) -> Path:
+    def resolve_under(
+        self,
+        root: Path,
+        relative_path: str,
+        *,
+        must_exist: bool = False,
+        allow_missing_ancestors: bool = False,
+    ) -> Path:
         parts = validate_relative_path(relative_path)
         candidate = root.joinpath(*parts) if parts else root
         if must_exist and not candidate.exists():
@@ -118,7 +125,15 @@ class SafeFilesystem:
                 raise PolicyError("SYMLINK_NOT_ALLOWED", "symlink targets are not allowed")
             return resolved
 
-        parent = candidate.parent.resolve(strict=True)
+        parent_candidate = candidate.parent
+        if allow_missing_ancestors:
+            while parent_candidate != root and not parent_candidate.exists():
+                parent_candidate = parent_candidate.parent
+            parent = parent_candidate.resolve(strict=True)
+            if parent != root and root not in parent.parents:
+                raise PolicyError("PATH_ESCAPE", "resolved parent is outside the allowed scope")
+            return candidate
+        parent = parent_candidate.resolve(strict=True)
         if parent != root and root not in parent.parents:
             raise PolicyError("PATH_ESCAPE", "resolved parent is outside the allowed scope")
         return parent / candidate.name

@@ -23,6 +23,7 @@ ALLOWED_OPERATIONS = {
     "create_branch": "switch",
     "stage": "add",
     "stage_for_commit": "add",
+    "staged_deletion": "diff",
     "commit": "commit",
     "restore": "restore",
     "push": "push",
@@ -122,6 +123,68 @@ class GitAdapter:
         except OSError as exc:
             raise PolicyError("GIT_UNAVAILABLE", "unable to start the fixed Git adapter") from exc
 
+    def stage_selected_paths(
+        self,
+        project_root: Path,
+        paths: list[str],
+        *,
+        output_limit: int = 65_536,
+        timeout_seconds: int = 300,
+    ) -> tuple[CommandResult, list[str]]:
+        """Stage explicit paths without re-adding already-staged deletions.
+
+        ``git add -- path`` is not idempotent for a path whose deletion is
+        already in the index: Git reports that the pathspec matches nothing.
+        Probe only missing paths with a fixed cached deletion check, then
+        stage the remaining explicit paths in one bounded invocation. A
+        missing path that is not already represented as a deletion is left to
+        Git to reject, so this helper cannot silently create a broad pathspec.
+        """
+        validated = self.validate_paths(paths)
+        to_stage: list[str] = []
+        already_staged: list[str] = []
+        for path in validated:
+            candidate = project_root.joinpath(*validate_relative_path(path))
+            if candidate.exists() or candidate.is_symlink():
+                to_stage.append(path)
+                continue
+            probe = self.run(
+                "staged_deletion",
+                project_root,
+                ["diff", "--cached", "--quiet", "--diff-filter=D", "--", path],
+                output_limit=output_limit,
+                timeout_seconds=timeout_seconds,
+            )
+            if probe.exit_code == 1:
+                already_staged.append(path)
+            elif probe.exit_code == 0:
+                to_stage.append(path)
+            else:
+                return probe, already_staged
+
+        if not to_stage:
+            return (
+                CommandResult(
+                    "git_stage",
+                    "git add (selected paths already staged)",
+                    0,
+                    "",
+                    "",
+                    False,
+                ),
+                already_staged,
+            )
+        return (
+            self.run(
+                "stage",
+                project_root,
+                ["add", "--", *to_stage],
+                output_limit=output_limit,
+                timeout_seconds=timeout_seconds,
+            ),
+            already_staged,
+        )
+
     @staticmethod
     def validate_branch(branch: str) -> str:
         if not isinstance(branch, str) or not BRANCH_RE.fullmatch(branch):
@@ -183,6 +246,11 @@ class GitAdapter:
             separator = args.index("--", 4)
             cls.commit_message(args[3])
             cls.validate_paths(args[separator + 1:])
+            return
+        if operation == "staged_deletion":
+            if len(args) != 6 or args[1:5] != ["--cached", "--quiet", "--diff-filter=D", "--"]:
+                raise PolicyError("GIT_OPERATION_NOT_ALLOWED", "staged-deletion arguments are fixed")
+            cls.validate_paths([args[5]])
             return
         if operation == "restore":
             if len(args) != 3 or args[1] != "--" or not validate_relative_path(args[2]):

@@ -16,19 +16,126 @@ from .supervisor import RuntimeSupervisor
 
 BRIDGE_POLL_INTERVAL_MS = 1_000
 
+APP_TITLE_FONT = ("Helvetica Neue", 22, "bold")
+SECTION_TITLE_FONT = ("Helvetica Neue", 16, "bold")
+BODY_FONT = ("Helvetica Neue", 13)
+MONO_FONT = ("SF Mono", 11)
+ERROR_FOREGROUND = "#a33a3a"
+
+STATE_LABELS = {
+    "not_configured": "Not configured",
+    "configured_stopped": "Configured, stopped",
+    "not_ready": "Not ready",
+    "ready_via_tunnel": "Ready via tunnel",
+    "tunnel_client_running": "Tunnel client running",
+    "not_directly_observable": "Not directly observable",
+    "stopped": "Stopped",
+    "starting": "Starting",
+    "running": "Running",
+    "healthy": "Healthy",
+    "ready": "Ready",
+    "unhealthy": "Unhealthy",
+    "unauthorized": "Unauthorized",
+}
+
+
+def display_value(value: Any, fallback: str = "Unknown") -> str:
+    """Render optional runtime values without implying a healthy state."""
+    if value is None or value == "":
+        return fallback
+    return str(value)
+
+
+def humanize_state(value: Any, fallback: str = "Unknown") -> str:
+    """Turn machine state identifiers into concise labels for people."""
+    if value is None or value == "":
+        return fallback
+    text = str(value)
+    return STATE_LABELS.get(text, text.replace("_", " ").capitalize())
+
+
+def filter_rows(rows: list[dict[str, Any]], query: str, fields: tuple[str, ...]) -> list[dict[str, Any]]:
+    """Filter visible table rows using a case-insensitive plain-text query."""
+    needle = query.strip().lower()
+    if not needle:
+        return list(rows)
+    return [
+        row
+        for row in rows
+        if any(needle in str(row.get(field, "")).lower() for field in fields)
+    ]
+
+
+def filter_tool_rows(rows: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
+    """Filter tools across the fields a user can see in the table."""
+    needle = query.strip().lower()
+    if not needle:
+        return list(rows)
+    return [
+        row
+        for row in rows
+        if needle in " ".join(
+            str(row.get(field, ""))
+            for field in ("name", "group", "risk", "approval_mode", "description")
+        ).lower()
+        or needle in tool_approval_label(row).lower()
+    ]
+
+
+def tool_approval_label(row: dict[str, Any]) -> str:
+    """Show the effective live execution state, including fail-closed tools."""
+    if row.get("live_execution_supported") is False:
+        if row.get("live_approval_required") is True and row.get("live_approval_available") is False:
+            return "Preview only"
+        return "Unavailable"
+    return humanize_state(row.get("approval_mode"), "Unknown")
+
+
+def filter_audit_rows(rows: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
+    """Filter audit rows without changing the source ordering or row identity."""
+    return filter_rows(
+        rows,
+        query,
+        ("seq", "occurred_at", "actor", "tool", "decision", "target_display", "error_code"),
+    )
+
+
+def format_overview_status(runtime: dict[str, Any], pending_count: int, approved_count: int) -> str:
+    """Build a compact, source-backed status block for the Overview page."""
+    bridge = runtime.get("bridge") if isinstance(runtime.get("bridge"), dict) else {}
+    lines = [
+        f"Policy v{display_value(runtime.get('policy_version'))}  ·  MCP bridge: {humanize_state(runtime.get('mcp_bridge'))}",
+        f"Tunnel: {humanize_state(runtime.get('tunnel'))}  ·  ChatGPT path: {humanize_state(runtime.get('chatgpt_path'))}",
+        f"Connection: {humanize_state(runtime.get('chatgpt_connection'))}  ·  Approvals: {pending_count} pending / {approved_count} ready",
+    ]
+    if bridge.get("stale"):
+        lines.append("Action required: restart the bridge to apply the latest policy.")
+    return "\n".join(lines)
+
+
+def scope_id_for_label(label: str) -> str:
+    """Build a valid stable scope ID from a Finder-selected name."""
+    candidate = re.sub(r"[^a-zA-Z0-9_-]+", "-", label.lower()).strip("-") or "scope"
+    if len(candidate) < 2 or not re.match(r"^[a-zA-Z]", candidate):
+        candidate = f"scope-{candidate}"
+    return candidate[:54]
+
 
 def format_bridge_state(data: dict[str, Any]) -> str:
     """Return a short bridge state suitable for status labels."""
-    return "Bridge stale" if data.get("stale") else f"Bridge {data.get('state', 'stopped')}"
+    if data.get("stale"):
+        return "Bridge stale"
+    state = data.get("state")
+    return f"Bridge {humanize_state(state)}" if state else "Bridge unavailable"
 
 
 def format_bridge_metrics(data: dict[str, Any]) -> str:
-    """Build the separate catalog, policy, and live-bridge counts."""
+    """Build the compact catalog, policy, and live-bridge summary."""
     lines = [
-        f"Registry total: {data.get('registry_total', 0)}",
-        f"Enabled: {data.get('enabled_count', 0)}",
-        f"Running bridge tools: {data.get('running_tool_count', 0)}",
-        format_bridge_state(data),
+        f"Registry total: {display_value(data.get('registry_total'))}  ·  "
+        f"Enabled: {display_value(data.get('enabled_count'))}  ·  "
+        f"Running bridge tools: {display_value(data.get('running_tool_count'))}  ·  "
+        f"{format_bridge_state(data)}",
     ]
     if data.get("stale"):
         lines.append("Action: Restart bridge to apply the latest policy.")
@@ -37,21 +144,21 @@ def format_bridge_metrics(data: dict[str, Any]) -> str:
 
 def format_runtime_status(data: dict[str, Any]) -> str:
     """Build a secret-free runtime summary for the GUI."""
-    tunnel = data["tunnel"]
+    tunnel = data.get("tunnel") if isinstance(data.get("tunnel"), dict) else {}
     tunnel_live = tunnel.get("state") in {"starting", "running", "healthy", "ready", "unhealthy"}
-    health = tunnel.get("health", {})
-    health_state = health.get("state", "-") if tunnel_live else "-"
-    control_plane = tunnel.get("control_plane", {})
-    control_plane_state = control_plane.get("state", "-") if tunnel_live else "-"
+    health = tunnel.get("health") if isinstance(tunnel.get("health"), dict) else {}
+    health_state = display_value(health.get("state"), "Unavailable") if tunnel_live else "Not running"
+    control_plane = tunnel.get("control_plane") if isinstance(tunnel.get("control_plane"), dict) else {}
+    control_plane_state = display_value(control_plane.get("state"), "Unavailable") if tunnel_live else "Not running"
     key_suffix = tunnel.get("api_key_suffix")
-    stored_key = f"{tunnel.get('api_key', 'missing')} ({key_suffix})" if key_suffix else tunnel.get("api_key", "missing")
+    stored_key = f"{display_value(tunnel.get('api_key'), 'Missing')} ({key_suffix})" if key_suffix else display_value(tunnel.get("api_key"), "Missing")
     lines = [
-        f"MCP bridge process: {data['processes']}",
-        f"Persisted runtime records: {data['persisted']}",
-        f"Tunnel: {tunnel.get('state')}",
-        f"Tunnel client: {tunnel.get('client_path') or '-'} ({'available' if tunnel.get('client_available') else 'not found'})",
-        f"Profile: {tunnel.get('profile') or '-'}",
-        f"Tunnel ID: {tunnel.get('tunnel_id') or '-'}",
+        f"MCP bridge process: {display_value(data.get('processes'), 'Unavailable')}",
+        f"Persisted runtime records: {display_value(data.get('persisted'), 'Unavailable')}",
+        f"Tunnel: {display_value(tunnel.get('state'))}",
+        f"Tunnel client: {display_value(tunnel.get('client_path'), 'Unavailable')} ({'available' if tunnel.get('client_available') else 'not found'})",
+        f"Profile: {display_value(tunnel.get('profile'), 'Not configured')}",
+        f"Tunnel ID: {display_value(tunnel.get('tunnel_id'), 'Not configured')}",
         f"Saved API key: {stored_key}",
         f"Health: {health_state}",
         f"OpenAI connection: {control_plane_state}",
@@ -59,7 +166,7 @@ def format_runtime_status(data: dict[str, Any]) -> str:
     if control_plane.get("message"):
         lines.append(control_plane["message"])
     lines.extend([
-        f"Profile directory: {tunnel.get('profile_dir')}",
+        f"Profile directory: {display_value(tunnel.get('profile_dir'), 'Unavailable')}",
         "Key Active/Inactive is managed on OpenAI Platform. This screen proves the saved key is accepted only when OpenAI connection has no authorization error.",
     ])
     return "\n".join(lines)
@@ -131,8 +238,21 @@ class ControlCenterApp:
             style.theme_use("aqua")
         except tk.TclError:
             pass
+        style.configure("Title.TLabel", font=APP_TITLE_FONT)
+        style.configure("Section.TLabel", font=SECTION_TITLE_FONT)
+        style.configure("Body.TLabel", font=BODY_FONT)
+        # Aqua supplies an appearance-aware label color; avoid hard-coding a
+        # dark gray that becomes unreadable when macOS is in Dark Mode.
+        style.configure("Muted.TLabel", font=("Helvetica Neue", 12))
+        style.configure("Status.TLabel", font=("Helvetica Neue", 14, "bold"))
+        style.configure("Error.TLabel", foreground=ERROR_FOREGROUND)
+        style.configure("Mono.TLabel", font=MONO_FONT)
+        style.configure("Treeview", rowheight=26)
+        style.configure("Treeview.Heading", font=("Helvetica Neue", 11, "bold"))
+        self.root.bind("<Command-r>", lambda _event: self.refresh_all())
+        self.root.bind("<Control-r>", lambda _event: self.refresh_all())
         notebook = ttk.Notebook(self.root)
-        notebook.pack(fill="both", expand=True, padx=12, pady=12)
+        notebook.pack(fill="both", expand=True, padx=16, pady=16)
         notebook.enable_traversal()
         self.notebook = notebook
         self._build_overview(notebook)
@@ -144,41 +264,76 @@ class ControlCenterApp:
         self._build_browser(notebook)
 
     def _build_overview(self, notebook: ttk.Notebook) -> None:
-        frame = ttk.Frame(notebook, padding=18)
-        notebook.add(frame, text="Overview")
-        ttk.Label(frame, text="Local MCP Control Center", font=("Helvetica", 22, "bold")).pack(anchor="w")
-        ttk.Label(frame, text="Least privilege, dangerous-action approvals, and append-only audit metadata.").pack(anchor="w", pady=(4, 18))
+        container = ttk.Frame(notebook)
+        self.overview_frame = container
+        notebook.add(container, text="Overview")
+        canvas = tk.Canvas(
+            container,
+            borderwidth=0,
+            highlightthickness=0,
+            background=ttk.Style(self.root).lookup("TFrame", "background"),
+        )
+        scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        frame = ttk.Frame(canvas, padding=18)
+        window = canvas.create_window((0, 0), window=frame, anchor="nw")
+        frame.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(window, width=event.width))
+        self.overview_canvas = canvas
+
+        header = ttk.Frame(frame)
+        header.pack(fill="x", pady=(0, 4))
+        ttk.Label(header, text="Local MCP Control Center", style="Title.TLabel").pack(side="left")
+        ttk.Button(header, text="Refresh status", command=self.refresh_all).pack(side="right")
+        ttk.Label(
+            frame,
+            text="Policy, connection and approval state from the local control plane.",
+            style="Muted.TLabel",
+        ).pack(anchor="w", pady=(2, 12))
+
+        self.overview_state = tk.StringVar(value="Status unavailable")
+        ttk.Label(frame, textvariable=self.overview_state, style="Status.TLabel").pack(anchor="w", pady=(0, 6))
+
+        current = ttk.LabelFrame(frame, text="Current state", padding=10)
+        current.pack(fill="x")
         self.overview_text = tk.StringVar()
-        ttk.Label(frame, textvariable=self.overview_text, justify="left", font=("Menlo", 12)).pack(anchor="w", pady=8)
+        ttk.Label(current, textvariable=self.overview_text, justify="left", style="Body.TLabel").pack(anchor="w")
         self.bridge_metrics = tk.StringVar()
-        ttk.Label(frame, textvariable=self.bridge_metrics, justify="left", font=("Menlo", 12)).pack(anchor="w", pady=8)
+        ttk.Label(current, textvariable=self.bridge_metrics, justify="left", style="Mono.TLabel").pack(anchor="w", pady=(6, 0))
+
         self.workspace_health_text = tk.StringVar(value="No registered project scope")
         health = ttk.LabelFrame(frame, text="Workspace health", padding=10)
         health.pack(fill="x", pady=(8, 0))
-        ttk.Label(health, textvariable=self.workspace_health_text, justify="left", font=("Menlo", 10)).pack(anchor="w")
-        actions = ttk.Frame(frame)
-        actions.pack(anchor="w", pady=18)
-        ttk.Button(actions, text="Start MCP bridge", command=self._start_mcp).pack(side="left", padx=(0, 8))
-        ttk.Button(actions, text="Stop MCP bridge", command=self._stop_mcp).pack(side="left", padx=(0, 8))
-        ttk.Button(actions, text="Configure tunnel", command=self._configure_tunnel).pack(side="left", padx=(0, 8))
-        ttk.Button(actions, text="Start tunnel", command=self._start_tunnel).pack(side="left", padx=(0, 8))
-        ttk.Button(actions, text="Stop tunnel", command=self._stop_tunnel).pack(side="left", padx=(0, 8))
-        ttk.Button(actions, text="Clear saved key", command=self._clear_tunnel_key).pack(side="left", padx=(0, 8))
-        ttk.Button(actions, text="Open ChatGPT settings", command=self._open_chatgpt_settings).pack(side="left", padx=(0, 8))
-        secondary_actions = ttk.Frame(frame)
-        secondary_actions.pack(anchor="w", pady=(8, 0))
-        ttk.Button(secondary_actions, text="Open Approvals", command=self._open_approvals).pack(side="left", padx=(0, 8))
-        ttk.Button(secondary_actions, text="Refresh", command=self.refresh_all).pack(side="left")
+        ttk.Label(health, textvariable=self.workspace_health_text, justify="left", style="Mono.TLabel").pack(anchor="w")
+
+        actions = ttk.LabelFrame(frame, text="Quick actions", padding=12)
+        actions.pack(fill="x", pady=(10, 0))
+        connection_actions = ttk.Frame(actions)
+        connection_actions.pack(anchor="w", pady=(0, 8))
+        ttk.Label(connection_actions, text="Services", style="Muted.TLabel").pack(side="left", padx=(0, 12))
+        ttk.Button(connection_actions, text="Start MCP bridge", command=self._start_mcp).pack(side="left", padx=(0, 8))
+        ttk.Button(connection_actions, text="Stop MCP bridge", command=self._stop_mcp).pack(side="left", padx=(0, 8))
+        ttk.Button(connection_actions, text="Configure tunnel", command=self._configure_tunnel).pack(side="left", padx=(0, 8))
+        ttk.Button(connection_actions, text="Start tunnel", command=self._start_tunnel).pack(side="left", padx=(0, 8))
+        ttk.Button(connection_actions, text="Stop tunnel", command=self._stop_tunnel).pack(side="left")
+        review_actions = ttk.Frame(actions)
+        review_actions.pack(anchor="w")
+        ttk.Label(review_actions, text="Review", style="Muted.TLabel").pack(side="left", padx=(0, 18))
+        ttk.Button(review_actions, text="Open approvals", command=self._open_approvals).pack(side="left", padx=(0, 8))
+        ttk.Button(review_actions, text="Clear saved key", command=self._clear_tunnel_key).pack(side="left", padx=(0, 8))
+        ttk.Button(review_actions, text="Open ChatGPT settings", command=self._open_chatgpt_settings).pack(side="left")
         ttk.Label(
             frame,
             text=(
-                "วิธีใช้งาน: 1) เพิ่มโฟลเดอร์ใน Allowed Paths  2) เปิด tools/permissions ที่ต้องการ  "
-                "3) Configure tunnel แล้ว Start tunnel  4) ไปที่ ChatGPT สร้าง developer-mode app และเลือก Tunnel  "
-                "5) พิมพ์คำสั่งธรรมชาติในบทสนทนา ChatGPT นั้น — หน้านี้เป็นศูนย์ควบคุม ไม่ใช่ช่องแชต  "
-                "การแก้ไข/สร้าง/ย้าย/ทดสอบทำทันทีเมื่อเปิดสิทธิ์; การลบไฟล์, Git restore และ Git push ต้องอนุมัติ",
+                "วิธีเริ่มต้น: เพิ่ม scope ใน Allowed Paths, เปิด tools/permissions ตามงานจริง, "
+                "จากนั้น Configure tunnel และ Start tunnel ก่อนเชื่อมต่อจาก ChatGPT. "
+                "การลบไฟล์, Git restore และ Git push ต้องอนุมัติใน Approvals."
             ),
             wraplength=900,
-        ).pack(anchor="w", pady=(20, 0))
+            style="Muted.TLabel",
+        ).pack(anchor="w", pady=(10, 0))
 
     def _build_paths(self, notebook: ttk.Notebook) -> None:
         frame = ttk.Frame(notebook, padding=12)
@@ -211,20 +366,62 @@ class ControlCenterApp:
         ttk.Button(editor, text="Save policy", command=self._save_scope_policy).grid(row=2, column=5, columnspan=2, sticky="e", pady=(8, 0))
 
     def _build_tools(self, notebook: ttk.Notebook) -> None:
-        frame = ttk.Frame(notebook, padding=12)
+        frame = ttk.Frame(notebook, padding=18)
+        self.tools_frame = frame
         notebook.add(frame, text="Tools")
-        ttk.Label(frame, text="Disabled tools are not registered in the MCP bridge until it is restarted.").pack(anchor="w", pady=(0, 8))
+
+        header = ttk.Frame(frame)
+        header.pack(fill="x", pady=(0, 4))
+        ttk.Label(header, text="Tools", style="Section.TLabel").pack(side="left")
         self.tool_summary = tk.StringVar()
-        ttk.Label(frame, textvariable=self.tool_summary, font=("Menlo", 10)).pack(anchor="w", pady=(0, 8))
+        ttk.Label(header, textvariable=self.tool_summary, style="Muted.TLabel").pack(side="right")
+
+        search = ttk.Frame(frame)
+        search.pack(fill="x", pady=(8, 4))
+        ttk.Label(search, text="Find a tool").pack(side="left", padx=(0, 8))
+        self.tool_search_var = tk.StringVar()
+        tool_search = ttk.Entry(search, textvariable=self.tool_search_var, width=44)
+        tool_search.pack(side="left")
+        ttk.Button(search, text="Clear", command=lambda: self.tool_search_var.set("")).pack(side="left", padx=(8, 0))
+        ttk.Label(search, text="name, group, risk, approval or description", style="Muted.TLabel").pack(side="left", padx=(12, 0))
+        self.tool_search_var.trace_add("write", lambda *_args: self._refresh_tools())
+        self.root.bind("<Command-f>", lambda _event: self._focus_tool_search(tool_search))
+        self.root.bind("<Control-f>", lambda _event: self._focus_tool_search(tool_search))
+
+        ttk.Label(
+            frame,
+            text="Disabled tools are not registered in the MCP bridge until it is restarted.",
+            style="Muted.TLabel",
+        ).pack(anchor="w", pady=(0, 8))
+
+        self.tool_filter_state = tk.StringVar(value="No tool data loaded")
+        ttk.Label(frame, textvariable=self.tool_filter_state, style="Muted.TLabel").pack(anchor="w", pady=(0, 4))
+
+        table = ttk.Frame(frame)
+        table.pack(fill="both", expand=True)
+        table.columnconfigure(0, weight=1)
+        table.rowconfigure(0, weight=1)
         columns = ("name", "group", "risk", "enabled", "approval", "description")
-        self.tool_tree = ttk.Treeview(frame, columns=columns, show="headings", height=20)
+        self.tool_tree = ttk.Treeview(table, columns=columns, show="headings", height=20, selectmode="browse")
         headings = {"name": "Tool", "group": "Group", "risk": "Risk", "enabled": "Enabled", "approval": "Approval", "description": "Description"}
         widths = {"name": 190, "group": 100, "risk": 90, "enabled": 80, "approval": 120, "description": 540}
         for column in columns:
             self.tool_tree.heading(column, text=headings[column])
             self.tool_tree.column(column, width=widths[column], anchor="w")
-        self.tool_tree.pack(fill="both", expand=True)
-        ttk.Button(frame, text="Toggle selected tool", command=self._toggle_tool).pack(anchor="w", pady=(8, 0))
+        self.tool_tree.grid(row=0, column=0, sticky="nsew")
+        tool_scroll = ttk.Scrollbar(table, orient="vertical", command=self.tool_tree.yview)
+        tool_scroll.grid(row=0, column=1, sticky="ns")
+        tool_horizontal = ttk.Scrollbar(table, orient="horizontal", command=self.tool_tree.xview)
+        tool_horizontal.grid(row=1, column=0, sticky="ew")
+        self.tool_tree.configure(yscrollcommand=tool_scroll.set, xscrollcommand=tool_horizontal.set)
+        self.tool_tree.bind("<<TreeviewSelect>>", self._update_tool_action_state)
+        self.tool_tree.bind("<Return>", lambda _event: self._toggle_tool())
+
+        actions = ttk.Frame(frame)
+        actions.pack(fill="x", pady=(8, 0))
+        self.tool_toggle_button = ttk.Button(actions, text="Toggle selected tool", command=self._toggle_tool)
+        self.tool_toggle_button.pack(side="left")
+        ttk.Button(actions, text="Refresh", command=self.refresh_all).pack(side="left", padx=(8, 0))
 
     def _build_approvals(self, notebook: ttk.Notebook) -> None:
         frame = ttk.Frame(notebook, padding=12)
@@ -253,27 +450,73 @@ class ControlCenterApp:
         ttk.Button(actions, text="Apply approved", command=self._apply).pack(side="left")
 
     def _build_audit(self, notebook: ttk.Notebook) -> None:
-        frame = ttk.Frame(notebook, padding=12)
+        frame = ttk.Frame(notebook, padding=18)
+        self.audit_frame = frame
         notebook.add(frame, text="Audit log")
+
+        header = ttk.Frame(frame)
+        header.pack(fill="x", pady=(0, 4))
+        ttk.Label(header, text="Audit log", style="Section.TLabel").pack(side="left")
         self.audit_state = tk.StringVar()
-        ttk.Label(frame, textvariable=self.audit_state).pack(anchor="w", pady=(0, 8))
+        ttk.Label(header, textvariable=self.audit_state, style="Muted.TLabel").pack(side="right")
+
+        search = ttk.Frame(frame)
+        search.pack(fill="x", pady=(8, 4))
+        ttk.Label(search, text="Find an event").pack(side="left", padx=(0, 8))
+        self.audit_search_var = tk.StringVar()
+        audit_search = ttk.Entry(search, textvariable=self.audit_search_var, width=44)
+        audit_search.pack(side="left")
+        ttk.Button(search, text="Clear", command=lambda: self.audit_search_var.set("")).pack(side="left", padx=(8, 0))
+        ttk.Label(search, text="tool, decision, target, actor or error", style="Muted.TLabel").pack(side="left", padx=(12, 0))
+        self.audit_search_var.trace_add("write", lambda *_args: self._refresh_audit())
+        self.root.bind("<Command-2>", lambda _event: self._focus_audit_search(audit_search))
+        self.root.bind("<Control-2>", lambda _event: self._focus_audit_search(audit_search))
+
+        self.audit_filter_state = tk.StringVar(value="No audit data loaded")
+        ttk.Label(frame, textvariable=self.audit_filter_state, style="Muted.TLabel").pack(anchor="w", pady=(0, 4))
+
+        table = ttk.Frame(frame)
+        table.pack(fill="both", expand=True)
+        table.columnconfigure(0, weight=1)
+        table.rowconfigure(0, weight=1)
         columns = ("seq", "time", "actor", "tool", "decision", "target", "error")
-        self.audit_tree = ttk.Treeview(frame, columns=columns, show="headings", height=20)
+        self.audit_tree = ttk.Treeview(table, columns=columns, show="headings", height=20, selectmode="browse")
         headings = {"seq": "#", "time": "Time", "actor": "Actor", "tool": "Tool", "decision": "Decision", "target": "Target", "error": "Error"}
         widths = {"seq": 55, "time": 190, "actor": 100, "tool": 190, "decision": 130, "target": 380, "error": 180}
         for column in columns:
             self.audit_tree.heading(column, text=headings[column])
             self.audit_tree.column(column, width=widths[column], anchor="w")
-        self.audit_tree.pack(fill="both", expand=True)
-        ttk.Button(frame, text="Verify audit chain", command=self._verify_audit).pack(anchor="w", pady=(8, 0))
+        self.audit_tree.grid(row=0, column=0, sticky="nsew")
+        audit_scroll = ttk.Scrollbar(table, orient="vertical", command=self.audit_tree.yview)
+        audit_scroll.grid(row=0, column=1, sticky="ns")
+        audit_horizontal = ttk.Scrollbar(table, orient="horizontal", command=self.audit_tree.xview)
+        audit_horizontal.grid(row=1, column=0, sticky="ew")
+        self.audit_tree.configure(yscrollcommand=audit_scroll.set, xscrollcommand=audit_horizontal.set)
+
+        actions = ttk.Frame(frame)
+        actions.pack(fill="x", pady=(8, 0))
+        ttk.Button(actions, text="Verify audit chain", command=self._verify_audit).pack(side="left")
+        ttk.Button(actions, text="Refresh", command=self.refresh_all).pack(side="left", padx=(8, 0))
 
     def _build_runtime(self, notebook: ttk.Notebook) -> None:
         frame = ttk.Frame(notebook, padding=18)
+        self.runtime_frame = frame
         notebook.add(frame, text="Runtime")
+        header = ttk.Frame(frame)
+        header.pack(fill="x", pady=(0, 4))
+        ttk.Label(header, text="Runtime & connection", style="Section.TLabel").pack(side="left")
+        ttk.Button(header, text="Refresh status", command=self.refresh_all).pack(side="right")
+        ttk.Label(
+            frame,
+            text="Process state, tunnel health and connection evidence reported by the local supervisor.",
+            style="Muted.TLabel",
+        ).pack(anchor="w", pady=(2, 14))
+        self.runtime_state = tk.StringVar(value="Runtime status unavailable")
+        ttk.Label(frame, textvariable=self.runtime_state, style="Status.TLabel").pack(anchor="w", pady=(0, 10))
         self.runtime_text = tk.StringVar()
-        ttk.Label(frame, textvariable=self.runtime_text, justify="left", font=("Menlo", 12)).pack(anchor="w")
+        ttk.Label(frame, textvariable=self.runtime_text, justify="left", style="Mono.TLabel").pack(anchor="w")
         self.runtime_bridge_metrics = tk.StringVar()
-        ttk.Label(frame, textvariable=self.runtime_bridge_metrics, justify="left", font=("Menlo", 12)).pack(anchor="w", pady=(8, 0))
+        ttk.Label(frame, textvariable=self.runtime_bridge_metrics, justify="left", style="Mono.TLabel").pack(anchor="w", pady=(8, 0))
         actions = ttk.Frame(frame)
         actions.pack(anchor="w", pady=18)
         ttk.Button(actions, text="Configure tunnel", command=self._configure_tunnel).pack(side="left", padx=(0, 8))
@@ -313,14 +556,71 @@ class ControlCenterApp:
         ).pack(anchor="w", pady=(16, 0))
 
     def refresh_all(self) -> None:
-        self._refresh_bridge_metrics()
-        self._refresh_overview()
-        self._refresh_scopes()
-        self._refresh_tools()
-        self._refresh_approvals()
-        self._refresh_audit()
-        self._refresh_runtime()
-        self._refresh_browser()
+        self._refresh_errors = {}
+        refreshers = (
+            ("bridge", self._refresh_bridge_metrics),
+            ("overview", self._refresh_overview),
+            ("scopes", self._refresh_scopes),
+            ("tools", self._refresh_tools),
+            ("approvals", self._refresh_approvals),
+            ("audit", self._refresh_audit),
+            ("runtime", self._refresh_runtime),
+            ("browser", self._refresh_browser),
+        )
+        for area, refresher in refreshers:
+            try:
+                refresher()
+            except Exception as exc:  # pragma: no cover - defensive UI boundary
+                self._record_refresh_error(area, exc)
+        if self._refresh_errors and hasattr(self, "overview_state"):
+            areas = ", ".join(sorted(self._refresh_errors))
+            self.overview_state.set(f"Refresh incomplete — unavailable: {areas}")
+
+    def _record_refresh_error(self, area: str, error: Exception) -> None:
+        """Keep the last useful table values while making a failed refresh explicit."""
+        if not hasattr(self, "_refresh_errors"):
+            self._refresh_errors = {}
+        self._refresh_errors[area] = type(error).__name__
+        message = f"{area.capitalize()} unavailable — showing last loaded data ({type(error).__name__})."
+        target = {
+            "tools": getattr(self, "tool_filter_state", None),
+            "audit": getattr(self, "audit_filter_state", None),
+            "approvals": getattr(self, "approval_state", None),
+            "runtime": getattr(self, "runtime_state", None),
+        }.get(area)
+        if target is not None:
+            target.set(message)
+        if area == "bridge" and hasattr(self, "runtime_bridge_metrics"):
+            self.runtime_bridge_metrics.set(message)
+        if hasattr(self, "overview_state"):
+            self.overview_state.set(f"Refresh incomplete — {area} status unavailable")
+
+    def _restore_overview_status(self) -> None:
+        """Restore the last source-backed banner after a live poll recovers."""
+        if not hasattr(self, "overview_state"):
+            return
+        if self._refresh_errors:
+            areas = ", ".join(sorted(self._refresh_errors))
+            self.overview_state.set(f"Refresh incomplete — unavailable: {areas}")
+            return
+        runtime = getattr(self, "_last_runtime_status", {})
+        bridge = self._bridge_status_cache
+        if bridge.get("stale"):
+            self.overview_state.set("Action required — MCP bridge is stale")
+        elif runtime.get("tunnel") == "not_configured":
+            self.overview_state.set("Setup required — secure tunnel is not configured")
+        elif runtime.get("chatgpt_path") == "not_ready":
+            self.overview_state.set("Ready locally — ChatGPT path is not ready")
+        elif runtime:
+            self.overview_state.set(f"Connection: {humanize_state(runtime.get('chatgpt_path'))}")
+        else:
+            self.overview_state.set("Status available")
+
+    def _clear_refresh_error(self, area: str) -> None:
+        if not hasattr(self, "_refresh_errors"):
+            return
+        self._refresh_errors.pop(area, None)
+        self._restore_overview_status()
 
     def _refresh_bridge_metrics(self) -> dict[str, Any]:
         bridge = self.broker.bridge_status()
@@ -336,26 +636,66 @@ class ControlCenterApp:
 
     def _poll_bridge_status(self) -> None:
         try:
-            self._refresh_bridge_metrics()
+            try:
+                self._refresh_bridge_metrics()
+            except Exception as exc:  # pragma: no cover - defensive UI boundary
+                self._record_refresh_error("bridge", exc)
+            else:
+                self._clear_refresh_error("bridge")
             if hasattr(self, "tool_tree"):
-                self._refresh_tools()
+                try:
+                    self._refresh_tools()
+                except Exception as exc:  # pragma: no cover - defensive UI boundary
+                    self._record_refresh_error("tools", exc)
+                else:
+                    self._clear_refresh_error("tools")
         finally:
             try:
                 self._bridge_poll_job = self.root.after(BRIDGE_POLL_INTERVAL_MS, self._poll_bridge_status)
             except tk.TclError:
                 self._bridge_poll_job = None
 
+    @staticmethod
+    def _focus_tool_search(entry: ttk.Entry) -> str:
+        entry.focus_set()
+        entry.selection_range(0, "end")
+        return "break"
+
+    @staticmethod
+    def _focus_audit_search(entry: ttk.Entry) -> str:
+        entry.focus_set()
+        entry.selection_range(0, "end")
+        return "break"
+
+    def _update_tool_action_state(self, _event: Any = None) -> None:
+        if hasattr(self, "tool_toggle_button"):
+            self.tool_toggle_button.configure(state="normal" if self.tool_tree.selection() else "disabled")
+
     def _refresh_overview(self) -> None:
         runtime = self.broker.invoke("runtime_status", actor="user")
         approvals = self.broker.actionable_approvals()
         pending_count = sum(approval["status"] == "pending" for approval in approvals)
         approved_count = sum(approval["status"] == "approved" for approval in approvals)
-        self.overview_text.set(
-            f"Control Center: ready\nPolicy version: {runtime.get('policy_version')}\n"
-            f"MCP bridge: {runtime.get('mcp_bridge')}\nTunnel: {runtime.get('tunnel')}\n"
-            f"ChatGPT path: {runtime.get('chatgpt_path')}\n"
-            f"Approvals: {pending_count} pending, {approved_count} ready to apply"
-        )
+        if runtime.get("status") != "ok":
+            message = runtime.get("message", runtime.get("error_code", "runtime status unavailable"))
+            self.overview_state.set("Connection status unavailable")
+            self.overview_text.set(f"Runtime status unavailable: {message}")
+            self._refresh_workspace_health()
+            return
+        self._last_runtime_status = runtime
+        bridge = runtime.get("bridge")
+        if isinstance(bridge, dict):
+            self._bridge_status_cache = bridge
+        bridge_state = self._bridge_status_cache
+        if bridge_state.get("stale"):
+            self.overview_state.set("Action required — MCP bridge is stale")
+        elif runtime.get("tunnel") == "not_configured":
+            self.overview_state.set("Setup required — secure tunnel is not configured")
+        elif runtime.get("chatgpt_path") == "not_ready":
+            self.overview_state.set("Ready locally — ChatGPT path is not ready")
+        else:
+            self.overview_state.set(f"Connection: {humanize_state(runtime.get('chatgpt_path'))}")
+        self.overview_text.set(format_overview_status(runtime, pending_count, approved_count))
         self._refresh_workspace_health()
 
     def _refresh_workspace_health(self) -> None:
@@ -383,35 +723,64 @@ class ControlCenterApp:
     def _refresh_scopes(self) -> None:
         if not hasattr(self, "scope_tree"):
             return
+        selected = tuple(self.scope_tree.selection())
+        rows = self.broker.policy.scope_summary(actor="user")
         for item in self.scope_tree.get_children():
             self.scope_tree.delete(item)
-        for scope in self.broker.policy.scope_summary(actor="user"):
+        for scope in rows:
             permissions = ", ".join(key for key, value in scope["permissions"].items() if value["allowed"]) or "none"
             self.scope_tree.insert("", "end", iid=scope["id"], values=(scope["id"], scope["label"], scope["kind"], "yes" if scope["enabled"] else "no", "yes" if scope["expose_to_mcp"] else "no", permissions, scope.get("root", "")))
+        restored = tuple(scope_id for scope_id in selected if scope_id in {scope["id"] for scope in rows})
+        if restored:
+            self.scope_tree.selection_set(*restored)
 
     def _refresh_tools(self) -> None:
         selected = tuple(self.tool_tree.selection())
+        rows = self.broker.tool_rows()
+        query = self.tool_search_var.get() if hasattr(self, "tool_search_var") else ""
+        shown = filter_tool_rows(rows, query)
         for item in self.tool_tree.get_children():
             self.tool_tree.delete(item)
-        rows = self.broker.tool_rows()
-        for row in rows:
-            self.tool_tree.insert("", "end", iid=row["name"], values=(row["name"], row["group"], row["risk"], "yes" if row["enabled"] else "no", row["approval_mode"], row["description"]))
-        restored = tuple(name for name in selected if name in {row["name"] for row in rows})
+        for row in shown:
+            self.tool_tree.insert(
+                "",
+                "end",
+                iid=row["name"],
+                values=(
+                    row["name"],
+                    row["group"],
+                    row["risk"],
+                    "yes" if row["enabled"] else "no",
+                    tool_approval_label(row),
+                    row["description"],
+                ),
+            )
+        restored = tuple(name for name in selected if name in {row["name"] for row in shown})
         if restored:
             self.tool_tree.selection_set(*restored)
         if hasattr(self, "tool_summary"):
             bridge = self._bridge_status_cache
             self.tool_summary.set(
-                f"Registry total: {bridge.get('registry_total', len(rows))}  |  "
-                f"Enabled: {bridge.get('enabled_count', sum(bool(row['enabled']) for row in rows))}  |  "
-                f"Running bridge tools: {bridge.get('running_tool_count', 0)}  |  "
+                f"Registry {display_value(bridge.get('registry_total'), str(len(rows)))}  |  "
+                f"Enabled {display_value(bridge.get('enabled_count'), str(sum(bool(row['enabled']) for row in rows)))}  |  "
+                f"Running {display_value(bridge.get('running_tool_count'))}  |  "
                 f"{format_bridge_state(bridge)}"
             )
+        if hasattr(self, "tool_filter_state"):
+            if shown:
+                self.tool_filter_state.set(f"Showing {len(shown)} of {len(rows)} tools")
+            elif rows:
+                self.tool_filter_state.set(f"No tools match ‘{query.strip()}’. Clear the search to show all {len(rows)} tools.")
+            else:
+                self.tool_filter_state.set("No tool definitions are available.")
+        if hasattr(self, "tool_toggle_button"):
+            self.tool_toggle_button.configure(state="normal" if restored else "disabled")
 
     def _refresh_approvals(self) -> None:
+        requests = self.broker.actionable_approvals()
+        selected = tuple(self.approval_tree.selection())
         for item in self.approval_tree.get_children():
             self.approval_tree.delete(item)
-        requests = self.broker.actionable_approvals()
         pending_count = sum(request["status"] == "pending" for request in requests)
         approved_count = sum(request["status"] == "approved" for request in requests)
         self.approval_state.set(
@@ -422,19 +791,54 @@ class ControlCenterApp:
         for request in requests:
             intent = request["intent"]
             self.approval_tree.insert("", "end", iid=request["id"], values=(request["id"], request["status"], intent.get("tool"), intent.get("operation"), self.broker._intent_display(intent), request["expires_at"]))
+        restored = tuple(approval_id for approval_id in selected if approval_id in {request["id"] for request in requests})
+        if restored:
+            self.approval_tree.selection_set(*restored)
 
     def _refresh_audit(self) -> None:
+        rows = self.broker.audit_page(200)
+        query = self.audit_search_var.get() if hasattr(self, "audit_search_var") else ""
+        shown = filter_audit_rows(rows, query)
+        selected = tuple(self.audit_tree.selection())
         for item in self.audit_tree.get_children():
             self.audit_tree.delete(item)
-        rows = self.broker.audit_page(200)
-        for row in rows:
-            self.audit_tree.insert("", "end", values=(row["seq"], row["occurred_at"], row["actor"], row["tool"], row["decision"], row["target_display"], row["error_code"] or ""))
+        for row in shown:
+            self.audit_tree.insert(
+                "",
+                "end",
+                iid=str(row["seq"]),
+                values=(
+                    row["seq"],
+                    row["occurred_at"],
+                    row["actor"],
+                    row["tool"],
+                    row["decision"],
+                    row["target_display"],
+                    row["error_code"] or "",
+                ),
+            )
+        restored = tuple(seq for seq in selected if seq in {str(row["seq"]) for row in shown})
+        if restored:
+            self.audit_tree.selection_set(*restored)
         verification = self.broker.verify_audit()
         self.audit_state.set("Audit chain: valid" if verification["valid"] else f"Audit chain: INVALID — {verification['message']}")
+        if hasattr(self, "audit_filter_state"):
+            if shown:
+                self.audit_filter_state.set(f"Showing {len(shown)} of {len(rows)} events")
+            elif rows:
+                self.audit_filter_state.set(f"No events match ‘{query.strip()}’. Clear the search to show all {len(rows)} events.")
+            else:
+                self.audit_filter_state.set("No audit events have been recorded.")
 
     def _refresh_runtime(self) -> None:
         data = self.supervisor.status()
         self.runtime_text.set(format_runtime_status(data))
+        tunnel = data.get("tunnel") if isinstance(data.get("tunnel"), dict) else {}
+        tunnel_state = display_value(tunnel.get("state"))
+        control_plane = tunnel.get("control_plane") if isinstance(tunnel.get("control_plane"), dict) else {}
+        connection_state = display_value(control_plane.get("state"), "Not observable")
+        if hasattr(self, "runtime_state"):
+            self.runtime_state.set(f"Tunnel: {tunnel_state}  ·  OpenAI connection: {connection_state}")
         if hasattr(self, "runtime_bridge_metrics"):
             self.runtime_bridge_metrics.set(format_bridge_metrics(self._bridge_status_cache))
 
@@ -481,8 +885,7 @@ class ControlCenterApp:
         if not selected:
             return
         label = Path(selected).name or "Allowed folder"
-        scope_id = re.sub(r"[^a-zA-Z0-9_-]+", "-", label.lower()).strip("-") or "scope"
-        scope_id = scope_id[:54]
+        scope_id = scope_id_for_label(label)
         index = 2
         existing = {scope["id"] for scope in self.broker.policy.scope_summary(actor="user")}
         base_id = scope_id
@@ -501,7 +904,7 @@ class ControlCenterApp:
             label=label,
             kind=kind,
             root=selected,
-            expose_to_mcp=False,
+            expose_to_mcp=True,
             permissions={"read": {"allowed": True, "approval_mode": ApprovalMode.NEVER}},
         )
         if result["status"] != "ok":

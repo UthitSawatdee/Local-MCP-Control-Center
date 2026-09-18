@@ -45,6 +45,18 @@ def _parser() -> argparse.ArgumentParser:
     commands.add_parser("list-tools", help="print tool policies as JSON")
     commands.add_parser("verify-audit", help="verify the local audit hash chain")
     commands.add_parser("status", help="print local control-center status")
+    codex_config = commands.add_parser("configure-codex", help="locally grant or revoke read-only Codex history access")
+    codex_config.add_argument("--executable", default="", help="selected absolute Codex executable path")
+    codex_config.add_argument("--codex-home", default="", help="selected Codex data directory")
+    codex_config.add_argument("--disable", action="store_true", help="revoke Codex history access")
+    codex_status = commands.add_parser("codex-status", help="show Codex reader readiness without exposing paths")
+    codex_status.add_argument("--probe", action="store_true", help="test the app-server initialization handshake")
+    codex_read = commands.add_parser("read-codex-thread", help="read one page of stored Codex history")
+    codex_read.add_argument("thread_id", help="UUID or codex://threads/<UUID>")
+    codex_read.add_argument("--limit", type=int, default=3)
+    codex_read.add_argument("--cursor")
+    codex_read.add_argument("--newest", action="store_true")
+    codex_read.add_argument("--include-tool-results", action="store_true")
     doctor = commands.add_parser("doctor", help="observe one registered project workspace")
     doctor.add_argument("project_id", help="registered project scope ID")
     observe = commands.add_parser("observe", help="observe one registered project workspace")
@@ -122,6 +134,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "status":
             _emit(broker.invoke("runtime_status", actor="user"))
             return 0
+        if args.command == "configure-codex":
+            result = broker.configure_codex_threads(executable=args.executable, codex_home=args.codex_home, enabled=not args.disable)
+            _emit(result)
+            return 0 if result.get("status") == "ok" else 2
+        if args.command == "codex-status":
+            result = broker.invoke("codex_status", {"probe": args.probe}, actor="user")
+            _emit(result)
+            return 0 if result.get("status") == "ok" else 2
+        if args.command == "read-codex-thread":
+            payload = {"thread_id": args.thread_id, "limit": args.limit, "sort_direction": "desc" if args.newest else "asc", "include_tool_results": args.include_tool_results}
+            if args.cursor:
+                payload["cursor"] = args.cursor
+            result = broker.invoke("codex_read_thread", payload, actor="user")
+            _emit(result)
+            return 0 if result.get("status") == "ok" else 2
         if args.command in {"doctor", "observe"}:
             result = broker.invoke("workspace_observe", {"project_id": args.project_id}, actor="user")
             _emit(result)

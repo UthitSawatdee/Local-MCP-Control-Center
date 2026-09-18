@@ -46,8 +46,6 @@ class PolicyEngine:
         candidate = Path(root).expanduser().absolute()
         if not candidate.exists():
             raise PolicyError("TARGET_NOT_FOUND", "scope root does not exist")
-        if candidate.is_symlink():
-            raise PolicyError("SYMLINK_NOT_ALLOWED", "scope root must not be a symlink")
         canonical = candidate.resolve(strict=True)
         if canonical in FORBIDDEN_ROOTS or canonical == Path.home().resolve():
             raise PolicyError("BROAD_SCOPE_DENIED", "home and system roots are not valid scopes")
@@ -62,8 +60,8 @@ class PolicyEngine:
 
         for existing in self.store.list_scopes():
             existing_root = Path(existing.root)
-            if canonical == existing_root or canonical in existing_root.parents or existing_root in canonical.parents:
-                raise PolicyError("SCOPE_OVERLAP", "overlapping scopes are rejected for deterministic policy")
+            if canonical == existing_root:
+                raise PolicyError("SCOPE_OVERLAP", "scope root is already registered; choose a distinct path")
 
         scope = Scope(
             id=scope_id,
@@ -101,13 +99,19 @@ class PolicyEngine:
         actor: str = "user",
         must_exist: bool = False,
         allow_file_scope: bool = False,
+        allow_missing_ancestors: bool = False,
     ) -> tuple[Scope, Path, str]:
         scope = self.get_scope(scope_id, actor=actor)
         if scope.kind == ScopeKind.FILE and not allow_file_scope:
             if relative_path not in ("", "."):
                 raise PolicyError("PATH_NOT_ALLOWED", "file scope only exposes its exact file")
         try:
-            target = self.filesystem.resolve_under(Path(scope.root), relative_path, must_exist=must_exist)
+            target = self.filesystem.resolve_under(
+                Path(scope.root),
+                relative_path,
+                must_exist=must_exist,
+                allow_missing_ancestors=allow_missing_ancestors,
+            )
         except FileNotFoundError as exc:
             raise PolicyError("TARGET_NOT_FOUND", "target does not exist") from exc
         relative = target.relative_to(Path(scope.root)).as_posix() if target != Path(scope.root) else "."

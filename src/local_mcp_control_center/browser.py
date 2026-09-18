@@ -213,17 +213,30 @@ class BrowserManager:
             os.chmod(profile_dir, 0o700)
             try:
                 playwright = self._ensure_playwright()
-                context = playwright.chromium.launch_persistent_context(
-                    user_data_dir=str(profile_dir),
-                    headless=self.headless,
-                    timeout=self.operation_timeout_ms,
-                )
+                try:
+                    context = playwright.chromium.launch_persistent_context(
+                        user_data_dir=str(profile_dir),
+                        headless=self.headless,
+                        timeout=self.operation_timeout_ms,
+                    )
+                except Exception as bundled_exc:
+                    if "executable doesn't exist" not in str(bundled_exc).lower():
+                        raise
+                    context = playwright.chromium.launch_persistent_context(
+                        user_data_dir=str(profile_dir),
+                        channel="chrome",
+                        headless=self.headless,
+                        timeout=self.operation_timeout_ms,
+                    )
             except PolicyError:
                 raise
             except Exception as exc:
                 self._stop_playwright_if_unused()
                 code = "BROWSER_PROFILE_IN_USE" if "already" in str(exc).lower() and "use" in str(exc).lower() else "BROWSER_LAUNCH_FAILED"
-                raise PolicyError(code, "unable to start the owned Chromium profile") from exc
+                raise PolicyError(
+                    code,
+                    "unable to start the owned Chromium profile; install Playwright Chromium or Google Chrome",
+                ) from exc
             session = BrowserSession(
                 session_id="br_" + secrets.token_urlsafe(12),
                 profile=profile,

@@ -36,7 +36,11 @@ def test_scope_is_relative_and_protected(broker, workspace: Path, tmp_path: Path
     assert escaped["error_code"] in {"PATH_ESCAPE", "SYMLINK_NOT_ALLOWED"}
 
 
-def test_overlapping_scope_is_rejected(broker, workspace: Path, tmp_path: Path) -> None:
+def test_overlapping_scopes_are_explicitly_selectable_and_exact_duplicates_rejected(
+    broker,
+    workspace: Path,
+    tmp_path: Path,
+) -> None:
     add_scope(broker, workspace, scope_id="first")
     child = workspace / "child"
     child.mkdir()
@@ -45,9 +49,47 @@ def test_overlapping_scope_is_rejected(broker, workspace: Path, tmp_path: Path) 
         label="second",
         kind="directory",
         root=str(child),
+        expose_to_mcp=True,
     )
-    assert result["status"] == "denied"
-    assert result["error_code"] == "SCOPE_OVERLAP"
+    assert result["status"] == "ok", result
+
+    duplicate = broker.add_scope(
+        scope_id="duplicate",
+        label="duplicate",
+        kind="directory",
+        root=str(workspace),
+    )
+    assert duplicate["status"] == "denied"
+    assert duplicate["error_code"] == "SCOPE_OVERLAP"
+
+
+def test_symlink_scope_root_is_canonicalized(broker, tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "note.txt").write_text("selected target\n", encoding="utf-8")
+    link = tmp_path / "selected-link"
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError:
+        pytest.skip("test environment cannot create a symlink scope root")
+
+    result = broker.add_scope(
+        scope_id="linked-scope",
+        label="linked-scope",
+        kind="directory",
+        root=str(link),
+        expose_to_mcp=True,
+    )
+
+    assert result["status"] == "ok", result
+    assert result["scope"]["root"] == str(target.resolve())
+    allow_capabilities(broker, "linked-scope", "read")
+    read = broker.invoke(
+        "read_file",
+        {"scope_id": "linked-scope", "relative_path": "note.txt"},
+    )
+    assert read["status"] == "ok"
+    assert read["content"] == "selected target\n"
 
 
 def test_protected_file_cannot_be_registered_as_a_scope(broker, tmp_path: Path) -> None:

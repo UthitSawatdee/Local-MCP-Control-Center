@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .codex_thread_integration import CodexThreadBrokerMixin
+
 import base64
 import binascii
 import hmac
@@ -27,6 +29,7 @@ from .errors import PolicyError, StorageError
 from .filesystem import MAX_READ_BYTES, SafeFilesystem, redact_text, sha256_bytes, sha256_file
 from .git_adapter import GitAdapter
 from .models import ApprovalRequest, ApprovalStatus, Capability, ScopeKind, utc_now
+from .motion_erp import MotionERPService
 from .patching import apply_text_patch
 from .policy import PolicyEngine
 from .processes import ManagedProcessManager
@@ -95,7 +98,7 @@ class RequestContext:
     started_monotonic: float
 
 
-class Broker:
+class Broker(CodexThreadBrokerMixin):
     """The single local authority for MCP actions and GUI policy operations."""
 
     def __init__(
@@ -116,6 +119,7 @@ class Broker:
             self.data_dir / "browser",
             headless=os.environ.get("LOCAL_MCP_BROWSER_HEADLESS") == "1",
         )
+        self.motion_erp = MotionERPService(self.browser)
         self.runner = FixedRunner(self.data_dir)
         self.git = GitAdapter(self.runner)
         self.processes = ManagedProcessManager(self.store, self.audit)
@@ -1222,7 +1226,13 @@ class Broker:
         scope_id, scope, permission = self._git_execution_scope(args, context)
         path = self._require_string(args, "path")
         self._validate_git_paths(scope_id, [path], context, allow_missing=True)
-        _, target, display = self.policy.resolve_path(scope_id, path, actor=context.actor, must_exist=False)
+        _, target, display = self.policy.resolve_path(
+            scope_id,
+            path,
+            actor=context.actor,
+            must_exist=False,
+            allow_missing_ancestors=True,
+        )
         current_hash = sha256_file(target) if target.is_file() else None
         supplied_hash = args.get("expected_hash")
         if supplied_hash is not None and supplied_hash != current_hash:
@@ -1299,7 +1309,11 @@ class Broker:
     ) -> None:
         for path in self.git.validate_paths(paths):
             _, target, _ = self.policy.resolve_path(
-                scope_id, path, actor=context.actor, must_exist=not allow_missing
+                scope_id,
+                path,
+                actor=context.actor,
+                must_exist=not allow_missing,
+                allow_missing_ancestors=allow_missing,
             )
             if target.exists() and (target.is_dir() or target.is_symlink()):
                 raise PolicyError("INVALID_INPUT", "Git operations accept regular files only")
@@ -1314,7 +1328,11 @@ class Broker:
         expected: dict[str, str | None] = {}
         for path in paths:
             _, target, display = self.policy.resolve_path(
-                scope_id, path, actor=context.actor, must_exist=False
+                scope_id,
+                path,
+                actor=context.actor,
+                must_exist=False,
+                allow_missing_ancestors=True,
             )
             expected[f"path:{display}"] = sha256_file(target) if target.is_file() else None
         return expected
@@ -2353,6 +2371,19 @@ class Broker:
             "policy_version": self.store.policy_version(),
             "executed": False,
         }
+        if not definition.live_execution_supported or definition.live_block_reason:
+            preview.update(
+                {
+                    "live_execution_supported": definition.live_execution_supported,
+                    "live_block_reason": definition.live_block_reason,
+                    "live_approval_required": (
+                        definition.live_approval_required
+                        if definition.live_approval_required is not None
+                        else True
+                    ),
+                    "live_approval_available": definition.live_approval_available,
+                }
+            )
         self._audit_success(
             context,
             "dry_run",
@@ -2510,6 +2541,95 @@ class Broker:
             "close",
             f"session:{self._browser_session_digest(session_id)}",
             metadata={"browser_session_digest": self._browser_session_digest(session_id)},
+        )
+        return result
+
+    def _tool_motion_calendar_month(self, args: dict[str, Any], context: RequestContext) -> dict[str, Any]:
+        session_id = self._require_string(args, "browser_session_id")
+        month = self._require_string(args, "month")
+        result = self.motion_erp.calendar_month(session_id, month, limit=int(args.get("limit", 500)))
+        self._audit_success(
+            context,
+            "motion_calendar_month",
+            "read",
+            f"session:{self._browser_session_digest(session_id)}:month={month}",
+            metadata={
+                "browser_session_digest": self._browser_session_digest(session_id),
+                "month": month,
+                "event_count": result.get("event_count", 0),
+                "truncated": bool(result.get("truncated")),
+            },
+        )
+        return result
+
+    def _tool_motion_project_task_search(self, args: dict[str, Any], context: RequestContext) -> dict[str, Any]:
+        session_id = self._require_string(args, "browser_session_id")
+        query = self._require_string(args, "query")
+        project_id = args.get("project_id")
+        result = self.motion_erp.project_task_search(
+            session_id,
+            query,
+            project_id=int(project_id) if project_id is not None else None,
+            limit=int(args.get("limit", 20)),
+        )
+        self._audit_success(
+            context,
+            "motion_project_task_search",
+            "read",
+            f"session:{self._browser_session_digest(session_id)}",
+            metadata={
+                "browser_session_digest": self._browser_session_digest(session_id),
+                "query_bytes": len(query.encode("utf-8")),
+                "project_count": len(result.get("projects", [])),
+                "task_count": len(result.get("tasks", [])),
+            },
+        )
+        return result
+
+    def _tool_motion_timesheet_month(self, args: dict[str, Any], context: RequestContext) -> dict[str, Any]:
+        session_id = self._require_string(args, "browser_session_id")
+        month = self._require_string(args, "month")
+        result = self.motion_erp.timesheet_month(session_id, month, limit=int(args.get("limit", 500)))
+        self._audit_success(
+            context,
+            "motion_timesheet_month",
+            "read",
+            f"session:{self._browser_session_digest(session_id)}:month={month}",
+            metadata={
+                "browser_session_digest": self._browser_session_digest(session_id),
+                "month": month,
+                "line_count": result.get("line_count", 0),
+                "truncated": bool(result.get("truncated")),
+            },
+        )
+        return result
+
+    def _tool_motion_timesheet_create_missing(self, args: dict[str, Any], context: RequestContext) -> dict[str, Any]:
+        session_id = self._require_string(args, "browser_session_id")
+        entries = args.get("entries")
+        if not isinstance(entries, list):
+            raise PolicyError("INVALID_INPUT", "entries must be a list")
+        dry_run = bool(args.get("dry_run", True))
+        if not dry_run:
+            raise PolicyError(
+                "MOTION_ERP_WRITE_REQUIRES_APPROVAL",
+                "live Motion ERP timesheet creation is disabled until an external-action approval is bound to the exact normalized rows; use dry_run=true to preview",
+            )
+        result = self.motion_erp.create_missing_timesheets(session_id, entries, dry_run=dry_run)
+        self._audit_success(
+            context,
+            "motion_timesheet_create_missing",
+            "preview" if dry_run else "create_missing",
+            f"session:{self._browser_session_digest(session_id)}",
+            metadata={
+                "browser_session_digest": self._browser_session_digest(session_id),
+                "dry_run": dry_run,
+                "entry_count": len(entries),
+                "planned_count": result.get("planned_count", 0),
+                "created_count": result.get("created_count", 0),
+                "skipped_count": result.get("skipped_count", 0),
+                "conflict_count": result.get("conflict_count", 0),
+            },
         )
         return result
 
@@ -2701,16 +2821,25 @@ class Broker:
                 elif tool == "git_stage_paths":
                     paths = self.git.validate_paths(payload["paths"])
                     displays = self._verify_git_preconditions(project_scope_id, paths, context, expected)
-                    git_result = self.git.run("stage", project_root, ["add", "--", *displays])
+                    git_result, already_staged = self.git.stage_selected_paths(project_root, displays)
                     result = self._git_mutation_result(git_result, project_scope_id, "paths", displays)
-                    metadata = {"exit_code": git_result.exit_code, "paths": displays}
+                    metadata = {
+                        "exit_code": git_result.exit_code,
+                        "paths": displays,
+                        "already_staged_paths": already_staged,
+                    }
                 elif tool == "git_commit":
                     paths = self.git.validate_paths(payload["paths"])
                     displays = self._verify_git_preconditions(project_scope_id, paths, context, expected)
                     before = self.runner.run("git_status", project_root, output_limit=65_536, timeout_seconds=60)
-                    stage_result = self.git.run("stage_for_commit", project_root, ["add", "--", *displays])
+                    stage_result, already_staged = self.git.stage_selected_paths(project_root, displays)
                     if stage_result.exit_code != 0:
                         result = self._git_mutation_result(stage_result, project_scope_id, "paths", displays)
+                        metadata = {
+                            "exit_code": stage_result.exit_code,
+                            "paths": displays,
+                            "already_staged_paths": already_staged,
+                        }
                     else:
                         git_result = self.git.run(
                             "commit",
@@ -2721,7 +2850,11 @@ class Broker:
                         result = self._git_mutation_result(git_result, project_scope_id, "paths", displays)
                         result["before_status"] = self._redact_command_result(before).to_dict()
                         result["after_status"] = self._redact_command_result(after).to_dict()
-                    metadata = {"exit_code": stage_result.exit_code if stage_result.exit_code != 0 else git_result.exit_code, "paths": displays}
+                        metadata = {
+                            "exit_code": stage_result.exit_code if stage_result.exit_code != 0 else git_result.exit_code,
+                            "paths": displays,
+                            "already_staged_paths": already_staged,
+                        }
                 elif tool == "git_restore_file":
                     path = self._verify_git_preconditions(project_scope_id, [payload["path"]], context, expected)[0]
                     git_result = self.git.run("restore", project_root, ["restore", "--", path])
@@ -3084,7 +3217,11 @@ class Broker:
         displays: list[str] = []
         for path in paths:
             _, target, display = self.policy.resolve_path(
-                scope_id, path, actor=context.actor, must_exist=False
+                scope_id,
+                path,
+                actor=context.actor,
+                must_exist=False,
+                allow_missing_ancestors=True,
             )
             current = sha256_file(target) if target.is_file() else None
             expected_hash = expected.get(f"path:{display}")

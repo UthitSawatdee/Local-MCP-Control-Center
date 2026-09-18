@@ -264,6 +264,78 @@ def test_controlled_git_mutation_and_dangerous_approval(broker, workspace: Path)
     assert broker.verify_audit()["valid"] is True
 
 
+def test_controlled_git_commit_handles_selected_paths_already_staged_as_deleted(broker, workspace: Path) -> None:
+    _git(workspace, "init", "-q")
+    _git(workspace, "config", "user.email", "test@example.invalid")
+    _git(workspace, "config", "user.name", "Runtime Test")
+    deleted = workspace / "already-staged-delete.txt"
+    deleted.write_text("remove me\n", encoding="utf-8")
+    _git(workspace, "add", "already-staged-delete.txt")
+    _git(workspace, "commit", "-qm", "initial")
+
+    deleted.unlink()
+    selected_new = workspace / "selected new file.txt"
+    selected_new.write_text("add me\n", encoding="utf-8")
+    add_scope(broker, workspace, kind="project")
+    allow_capabilities(broker, "test-scope", "read", "execute")
+    enable_tools(broker, "git_stage_paths", "git_commit")
+
+    staged_delete = broker.invoke(
+        "git_stage_paths",
+        {"scope_id": "test-scope", "paths": ["already-staged-delete.txt"]},
+    )
+    assert staged_delete["status"] == "ok", staged_delete
+    staged_delete_again = broker.invoke(
+        "git_stage_paths",
+        {"scope_id": "test-scope", "paths": ["already-staged-delete.txt"]},
+    )
+    assert staged_delete_again["status"] == "ok", staged_delete_again
+
+    committed = broker.invoke(
+        "git_commit",
+        {
+            "scope_id": "test-scope",
+            "message": "commit selected deletion and addition",
+            "paths": ["already-staged-delete.txt", "selected new file.txt"],
+        },
+    )
+
+    assert committed["status"] == "ok", committed
+    assert "already-staged-delete.txt" in committed["result"]["stdout"]
+    assert "selected new file.txt" in committed["result"]["stdout"]
+    assert broker.verify_audit()["valid"] is True
+
+
+def test_controlled_git_commit_handles_deleted_paths_with_missing_ancestors(broker, workspace: Path) -> None:
+    _git(workspace, "init", "-q")
+    _git(workspace, "config", "user.email", "test@example.invalid")
+    _git(workspace, "config", "user.name", "Runtime Test")
+    deleted_directory = workspace / "removed-directory"
+    deleted_directory.mkdir()
+    (deleted_directory / "nested.txt").write_text("remove me\n", encoding="utf-8")
+    _git(workspace, "add", "removed-directory/nested.txt")
+    _git(workspace, "commit", "-qm", "initial")
+
+    moved_away = workspace.parent / "removed-directory-away"
+    deleted_directory.rename(moved_away)
+    add_scope(broker, workspace, kind="project")
+    allow_capabilities(broker, "test-scope", "read", "execute")
+    enable_tools(broker, "git_commit")
+
+    committed = broker.invoke(
+        "git_commit",
+        {
+            "scope_id": "test-scope",
+            "message": "commit nested deletion",
+            "paths": ["removed-directory/nested.txt"],
+        },
+    )
+
+    assert committed["status"] == "ok", committed
+    assert "nested.txt" in committed["result"]["stdout"]
+    assert broker.verify_audit()["valid"] is True
+
+
 def test_project_tools_route_concurrently_by_explicit_scope(
     broker,
     workspace: Path,

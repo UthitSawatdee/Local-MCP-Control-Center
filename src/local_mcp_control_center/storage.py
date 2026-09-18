@@ -505,6 +505,31 @@ class Store:
             self._conn.execute("DELETE FROM meta WHERE key=?", (MCP_BRIDGE_SNAPSHOT_KEY,))
             self._conn.commit()
 
+    def get_codex_thread_config(self) -> dict[str, Any] | None:
+        """Local-only path grant; no Codex auth or transcript data is stored here."""
+        row = self._fetchone("SELECT value FROM meta WHERE key='codex_thread_config'")
+        if not row:
+            return None
+        try:
+            value = json.loads(row["value"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise StorageError("Codex configuration is corrupted") from exc
+        if not isinstance(value, dict):
+            raise StorageError("Codex configuration must be an object")
+        return value
+
+    def set_codex_thread_config(self, config: dict[str, Any]) -> None:
+        if set(config) not in ({"enabled"}, {"enabled", "executable", "codex_home"}) or type(config.get("enabled")) is not bool:
+            raise StorageError("Codex configuration contains unsupported fields")
+        encoded = json.dumps(config, ensure_ascii=False, sort_keys=True)
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO meta(key, value) VALUES('codex_thread_config', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (encoded,),
+            )
+            self._conn.commit()
+
     def get_tunnel_config(self) -> dict[str, Any] | None:
         """Return non-secret tunnel settings; the API key never lives in SQLite."""
         row = self._fetchone("SELECT value FROM meta WHERE key='tunnel_config'")

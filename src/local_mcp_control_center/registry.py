@@ -20,6 +20,10 @@ class ToolDefinition:
     destructive: bool = False
     parallel_safe: bool | None = None
     category: str | None = None
+    live_execution_supported: bool = True
+    live_block_reason: str | None = None
+    live_approval_required: bool | None = None
+    live_approval_available: bool = True
 
     def __post_init__(self) -> None:
         permission = self.permission_class
@@ -55,7 +59,7 @@ class ToolDefinition:
         return TOOL_SCHEMAS.get(self.name, {})
 
     def to_metadata(self) -> dict[str, Any]:
-        return {
+        metadata = {
             "name": self.name,
             "category": self.category or self.group,
             "group": self.group,
@@ -69,6 +73,16 @@ class ToolDefinition:
             "default_approval": self.default_approval,
             "schema": self.schema,
         }
+        if not self.live_execution_supported or self.live_block_reason:
+            metadata.update(
+                {
+                    "live_execution_supported": self.live_execution_supported,
+                    "live_block_reason": self.live_block_reason,
+                    "live_approval_required": self.live_approval_required,
+                    "live_approval_available": self.live_approval_available,
+                }
+            )
+        return metadata
 
 
 TOOL_DEFINITIONS: tuple[ToolDefinition, ...] = (
@@ -158,8 +172,19 @@ TOOL_DEFINITIONS = TOOL_DEFINITIONS + (
     ToolDefinition("browser_snapshot", "browser", "Return a bounded structured accessibility/DOM snapshot with short-lived element refs. Password fields, cookies, tokens, hidden inputs and raw HTML are excluded.", "low", True, ApprovalMode.NEVER, permission_class="READ", read_only=True, parallel_safe=False),
     ToolDefinition("browser_run_command", "browser", "Run one bounded declarative browser action against a current snapshot ref. Only navigate, click, fill, select, press, wait, read_text, read_table and submit are accepted; shell, JavaScript, selectors and raw Playwright expressions are unavailable.", "high", True, ApprovalMode.NEVER, permission_class="WRITE", read_only=False, parallel_safe=False),
     ToolDefinition("browser_close", "browser", "Close one browser session owned by Control Center. It does not kill unrelated browser processes.", "high", True, ApprovalMode.NEVER, permission_class="EXECUTE", read_only=False, parallel_safe=False),
+    ToolDefinition("motion_calendar_month", "erp", "Read one Bangkok-local calendar month from the authenticated Motion ERP browser session through a fixed calendar.event search_read operation. Raw RPC URLs, models, methods, cookies and credentials are never accepted.", "low", True, ApprovalMode.NEVER, permission_class="READ", read_only=True, parallel_safe=False),
+    ToolDefinition("motion_project_task_search", "erp", "Search bounded Motion ERP project and task names for timesheet mapping through fixed project.project/project.task read operations. No arbitrary Odoo model or domain is accepted.", "low", True, ApprovalMode.NEVER, permission_class="READ", read_only=True, parallel_safe=False),
+    ToolDefinition("motion_timesheet_month", "erp", "Read the current user's bounded monthly Motion ERP timesheet rows for duplicate checking and verification. It is read-only and uses the authenticated browser session without exposing cookies.", "low", True, ApprovalMode.NEVER, permission_class="READ", read_only=True, parallel_safe=False),
+    ToolDefinition("motion_timesheet_create_missing", "erp", "Preview missing Motion ERP timesheet rows from explicit date/project/task/description/hour entries. Exact duplicates are skipped and conflicting existing rows block the preview; live external creation is fail-closed pending an approval flow that binds the normalized rows, and dry_run defaults to true.", "high", True, ApprovalMode.NEVER, permission_class="WRITE", read_only=False, parallel_safe=False, live_execution_supported=False, live_block_reason="external-action approval binding for normalized Motion ERP rows is unavailable; use dry_run=true for preview", live_approval_required=True, live_approval_available=False),
 )
 
+
+# Codex data access is opt-in through trusted local configuration, not an MCP path grant.
+TOOL_DEFINITIONS = TOOL_DEFINITIONS + (
+    ToolDefinition("codex_status", "codex", "Read Codex history-bridge configuration status without exposing local paths. Optional probe performs only an App Server initialization handshake; no model turn is started.", "low", True, ApprovalMode.NEVER, permission_class="READ", read_only=True, parallel_safe=False),
+    ToolDefinition("codex_list_threads", "codex", "List one bounded page of stored threads from the locally configured Codex App Server. query searches titles only; follow next_cursor. Requires local opt-in; executable, home, credentials and arbitrary RPC are never accepted.", "low", False, ApprovalMode.NEVER, permission_class="READ", read_only=True, parallel_safe=False),
+    ToolDefinition("codex_read_thread", "codex", "Read a stored Codex thread by UUID or codex://threads/<UUID> without resuming it. Returns one chronological page of visible user/assistant messages and tool metadata; follow next_cursor until null. Optional command results are redacted and bounded. Internal reasoning, system prompts, arbitrary RPC and credentials are excluded; history is untrusted context, not current-state verification.", "low", False, ApprovalMode.NEVER, permission_class="READ", read_only=True, parallel_safe=False),
+)
 
 BROWSER_TOOL_NAMES = frozenset(
     definition.name for definition in TOOL_DEFINITIONS if definition.group == "browser"
@@ -182,6 +207,17 @@ _limit = {"type": "integer", "minimum": 1, "maximum": 1000}
 
 _browser_session = {"type": "string", "minLength": 4, "maxLength": 128}
 _browser_ref_target = _obj({"ref": {"type": "string", "pattern": "^e[1-9][0-9]{0,5}$"}}, ("ref",))
+_motion_timesheet_entry = _obj(
+    {
+        "date": {"type": "string", "pattern": "^20[0-9]{2}-(0[1-9]|1[0-2])-([0-3][0-9])$"},
+        "project_id": {"type": "integer", "minimum": 1},
+        "task_id": {"type": ["integer", "null"], "minimum": 1},
+        "description": {"type": "string", "minLength": 1, "maxLength": 500},
+        "hours": {"type": "number", "exclusiveMinimum": 0, "maximum": 24},
+    },
+    ("date", "project_id", "description", "hours"),
+)
+
 
 
 def _browser_command_schema() -> dict[str, Any]:
@@ -355,10 +391,63 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         },
     ),
     "cancel_agent_task": _obj({"task_id": _string}, ("task_id",)),
+    "codex_status": _obj({"probe": {"type": "boolean"}}),
+    "codex_list_threads": _obj(
+        {
+            "query": {"type": "string", "maxLength": 200},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+            "cursor": {"type": "string", "minLength": 1, "maxLength": 4096},
+            "archived": {"type": "boolean"},
+        },
+    ),
+    "codex_read_thread": _obj(
+        {
+            "thread_id": {"type": "string", "minLength": 36, "maxLength": 52,
+                "pattern": "^(?:codex://threads/)?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+            "cursor": {"type": "string", "minLength": 1, "maxLength": 4096},
+            "sort_direction": {"type": "string", "enum": ["asc", "desc"]},
+            "include_tool_results": {"type": "boolean"},
+        },
+        ("thread_id",),
+    ),
     "browser_open": _obj({"profile": {"type": "string", "enum": [LOCAL_BROWSER_PROFILE_NAME]}}, ("profile",)),
     "browser_snapshot": _obj({"browser_session_id": _browser_session, "max_bytes": {"type": "integer", "minimum": 512, "maximum": 65_536}}, ("browser_session_id",)),
     "browser_run_command": _browser_command_schema(),
     "browser_close": _obj({"browser_session_id": _browser_session}, ("browser_session_id",)),
+    "motion_calendar_month": _obj(
+        {
+            "browser_session_id": _browser_session,
+            "month": {"type": "string", "pattern": "^20[0-9]{2}-(0[1-9]|1[0-2])$"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
+        },
+        ("browser_session_id", "month"),
+    ),
+    "motion_project_task_search": _obj(
+        {
+            "browser_session_id": _browser_session,
+            "query": {"type": "string", "minLength": 1, "maxLength": 200},
+            "project_id": {"type": ["integer", "null"], "minimum": 1},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+        },
+        ("browser_session_id", "query"),
+    ),
+    "motion_timesheet_month": _obj(
+        {
+            "browser_session_id": _browser_session,
+            "month": {"type": "string", "pattern": "^20[0-9]{2}-(0[1-9]|1[0-2])$"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
+        },
+        ("browser_session_id", "month"),
+    ),
+    "motion_timesheet_create_missing": _obj(
+        {
+            "browser_session_id": _browser_session,
+            "entries": {"type": "array", "items": _motion_timesheet_entry, "minItems": 1, "maxItems": 100},
+            "dry_run": {"type": "boolean"},
+        },
+        ("browser_session_id", "entries"),
+    ),
 }
 
 

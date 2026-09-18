@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .codex_thread_gui import show_codex_config
+
 import tkinter as tk
 from tkinter import ttk
 from typing import Any
@@ -140,6 +142,7 @@ class ControlCenterUXApp(ControlCenterApp):
         actions.pack(fill="x", pady=(8, 0))
         ttk.Button(actions, text="Toggle selected tool", command=self._toggle_tool).pack(side="left")
         ttk.Button(actions, text="Refresh", command=self.refresh_all).pack(side="left", padx=(8, 0))
+        ttk.Button(actions, text="Configure Codex", command=lambda: show_codex_config(self.root, self.broker)).pack(side="left", padx=(8, 0))
 
     def _build_runtime(self, notebook: ttk.Notebook) -> None:
         frame = ttk.Frame(notebook, padding=18)
